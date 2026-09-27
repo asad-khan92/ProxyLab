@@ -1,0 +1,137 @@
+[package]
+name = "proxy-engine"
+version.workspace = true
+edition.workspace = true
+# Raised above the workspace default because `proxy-tls` needs 1.88 (see its
+# manifest) and tokio 1.53 needs 1.71.
+rust-version = "1.88"
+description = "ProxyLab proxy engine: TCP listeners, connection lifecycle, and upstream connections."
+
+[dependencies]
+# Async TCP accept loop, task spawning, and Ctrl+C handling. The standard
+# library only provides blocking sockets and no signal handling, so the
+# alternative was a thread-per-connection accept loop plus a hand-rolled SIGINT
+# handler; that was rejected because the proxy's next steps (CONNECT tunnels,
+# concurrent upstream connections) need many long-lived idle connections, which
+# a thread-per-connection model does not carry well.
+# `io-util` is enabled for `copy_bidirectional`, which is what a CONNECT
+# tunnel is: two concurrent copies with the half-close handling that lets a
+# client finish sending and still be sent the whole answer. Writing that by
+# hand over `poll_read`/`poll_write` was the alternative and was rejected —
+# the half-close and shutdown ordering is the part worth getting right, and
+# this is tokio's own version of it. No new dependency: tokio is already here.
+# `sync` is enabled for the async mutex that holds an intercepted
+# connection's upstream request sender: sending a request is an `await`, so
+# the lock has to be one that can be held across one.
+# `time` is enabled for the timers throttling and breakpoints are built on:
+# pacing a body is a sleep per piece, and an exchange held at a breakpoint has
+# a deadline it is released at. It was already reaching this crate through
+# `hyper-util`, which is not a thing to depend on by accident.
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+
+# TLS interception: the development CA, the certificate minted for each
+# intercepted host, and the two TLS sessions a `CONNECT` becomes. Everything
+# TLS lives in that crate — no rustls type, trust store, or private key
+# reaches this one. Not a new third-party dependency: it is this workspace's
+# own crate.
+proxy-tls = { path = "../tls" }
+
+# `getifaddrs`, and nothing else: the one system call that says which
+# addresses this Mac's interfaces currently hold, which is what LAN exposure
+# offers a developer to choose from. The standard library has no way to
+# enumerate interfaces at all. The alternatives were running `ifconfig` and
+# parsing its output — a child process per refresh, and a text format that is
+# not an API — and a wrapper crate such as `if-addrs`, which is this same call
+# with a layer on top; both were rejected in favour of the call itself, kept
+# to one function in `lan::discovery`. Not a new dependency in any case: libc
+# is already in the tree as tokio's own.
+libc = "0.2"
+
+# The IPC boundary the macOS UI reaches the core through: the Unix socket
+# server, its protocol, and the traffic subscription. Only the binary uses
+# it — it is what wires the listener, the storage, and the socket together —
+# and nothing in the library depends on it, so the proxy itself stays
+# buildable and testable with no IPC in the picture. Not a new third-party
+# dependency: it is this workspace's own crate.
+proxy-ipc = { path = "../ipc" }
+
+# The canonical request a replay carries, checked before it reaches this
+# crate: a URL that names a host on a scheme this proxy speaks, a method that
+# is a token, and headers that cannot split a request in two. Not a new
+# third-party dependency: it is this workspace's own crate.
+proxy-http = { path = "../http" }
+
+# The captured traffic model, the body capture limit, and the event stream
+# finished exchanges are published on. Everything a captured exchange is made
+# of lives in that crate, so no hyper type reaches a subscriber. Not a new
+# third-party dependency: it is this workspace's own crate.
+proxy-storage = { path = "../storage" }
+
+# The rule engine the pipeline consults before it carries a request, and the
+# actions it carries out. Evaluation is pure and lives there; this crate is
+# where the decision becomes a response, a file read, or a connection to
+# somewhere else. Not a new third-party dependency: it is this workspace's
+# own crate.
+rules = { path = "../rules" }
+
+# HTTP/1.1 framing on both sides of the proxy: reading the client's request and
+# writing its response (`server`), and issuing the origin request and reading
+# its response (`client`). The alternative was parsing HTTP by hand, or using
+# `httparse` for the head and framing bodies ourselves; both were rejected
+# because chunked transfer coding, body length rules, and the responses that
+# carry no body are exactly the details a debugging proxy must get right, and a
+# hand-rolled implementation would get them wrong.
+#
+# `http2` is enabled alongside `http1` because ProxyLab now negotiates HTTP/2
+# over TLS. It is a feature of a crate that is already here, not a new
+# dependency and not a second HTTP stack: the same `Request`, `Response` and
+# `Body` types serve both protocols, so framing is the only thing that
+# differs. It brings in the `h2` crate, which is hyper's own HTTP/2
+# implementation — its HPACK codec, its framing, and its flow control. Writing
+# any of that by hand was the alternative and was rejected outright: header
+# compression and flow control are exactly the parts a proxy must not get
+# wrong, and there is no way to speak HTTP/2 without them.
+hyper = { version = "1.11", features = ["http1", "http2", "server", "client"] }
+
+# `TokioIo`, the adapter between `tokio::net::TcpStream` and hyper's own
+# `hyper::rt` I/O traits. hyper deliberately ships no runtime bindings, so
+# without this the crate would have to hand-roll the same adapter; this is the
+# hyper project's own version of it. Only the `tokio` feature is enabled — no
+# client pool, no server helpers.
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+# Body types for the responses the proxy generates itself (`Full`) and one
+# uniform body type (`BoxBody`) that can hold either a generated body or the
+# origin's streamed body. Also from the hyper project; writing the two
+# `http_body::Body` implementations by hand was the alternative and adds code
+# without adding behaviour.
+http-body-util = "0.1"
+
+[dev-dependencies]
+# Test clients, the in-process origin servers, and the in-process TLS servers
+# an intercepted connection is pointed at: reading and writing sockets
+# directly, oneshot shutdown signals, and timeouts so a stalled proxy fails
+# the suite instead of hanging it.
+tokio = { version = "1", features = ["io-util", "sync", "time"] }
+
+# The IPC tests speak the protocol by hand, over the socket, because what is
+# under test is the bytes on the wire: a client built from the server's own
+# types would not exercise them. Already in the tree, as `proxy-ipc`'s own
+# wire format.
+serde_json = "1"
+
+# A temporary directory per test for the traffic database the persistence
+# tests store into, removed with the test. The alternative was building
+# unique paths under the system temporary directory by hand and removing them
+# in a guard, which is this crate reimplemented, badly. Already in the tree as
+# `proxy-storage`'s own test dependency.
+tempfile = "3"

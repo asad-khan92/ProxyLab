@@ -1,0 +1,109 @@
+[package]
+name = "proxy-storage"
+version.workspace = true
+edition.workspace = true
+# Raised above the workspace default because tokio 1.53 needs 1.71. The
+# alternative was pinning an older tokio here than the one the proxy engine
+# already builds, which would put two versions of it in the tree.
+rust-version = "1.71"
+description = "ProxyLab storage: captured request/response persistence, models, bodies, timing, and the traffic event stream."
+
+[dependencies]
+# The traffic model is the canonical one: a future IPC boundary, a future
+# persistence layer, and the future macOS UI all read the same structures, and
+# every one of those needs them serialized. Deriving serde's traits on the
+# model is what keeps that one model rather than three hand-written
+# conversions. Not new to the build: serde is already in the dependency tree.
+serde = { version = "1", features = ["derive"] }
+
+# Raw bytes — request and response bodies, and the rare header value that is
+# not text — have no text form, so the model encodes them as base64. The
+# alternative was serde's own default for `Vec<u8>`, a JSON array of numbers,
+# which was rejected because it is several times larger and unreadable to
+# anything looking at the JSON. Also not new to the build: base64 is already
+# in the dependency tree, under `pem`.
+base64 = "0.23"
+
+# The traffic event stream, and the bounded channel in front of the storage
+# worker. `broadcast` is a bounded, multi-subscriber channel, which is the
+# shape the publisher needs: any number of future subscribers, none of them
+# able to stall the proxy, and a defined answer for one that falls behind.
+# The alternative was a list of subscriber senders behind a mutex, rejected
+# because that lag behaviour is the part worth getting right and this is
+# tokio's own version of it.
+#
+# `rt` is enabled for `spawn_blocking`, which is where the storage worker
+# runs: SQLite is synchronous, so the worker owns a thread from tokio's
+# blocking pool rather than blocking a proxy task. No runtime and no I/O
+# driver come with either feature.
+tokio = { version = "1", features = ["rt", "sync"] }
+
+# The metadata database. SQLite is the obvious choice for a single-user
+# desktop debugging proxy — one file, no server, and a UI can read it while
+# the proxy writes it — and `rusqlite` is the mature Rust binding to it.
+# `sqlx` was the alternative and was rejected: it brings an async runtime, a
+# connection pool, and compile-time query checking against a live database,
+# none of which a single embedded file needs. An ORM was rejected for the same
+# reason — the schema here is three tables and the queries are hand-written.
+#
+# `bundled` compiles SQLite's own amalgamation into the binary instead of
+# linking whatever the machine happens to ship, so the schema, the SQL, and
+# the tests run against one known version. `default-features = false` drops
+# the statement cache and the WebAssembly FFI shim; neither is used.
+rusqlite = { version = "0.40", default-features = false, features = [
+    "bundled",
+    "functions",
+] }
+
+# Optional regex search over captured traffic. SQLite has no REGEXP unless a
+# function is registered, and writing an engine is not a thing this crate
+# should own. `regex` is the crate the rest of the ecosystem uses; the
+# alternative was scanning every row in Rust after listing ids, which was
+# rejected because paging would then load every matching body to decide the
+# next page. A registered function keeps paging in SQL and compiles a pattern
+# once per query.
+regex = "1"
+
+# Exchange identifiers. A persisted exchange needs an identity that cannot
+# collide across runs of the proxy, which the previous in-process counter
+# could not give. Version 7 is the variant chosen because it is ordered by
+# the time it was minted, so ids sort the way traffic happened and make a
+# stable tie-break for the newest-first ordering the traffic list is built
+# on. Hand-rolling the layout and the parser was the alternative and was
+# rejected: this is a wire format other tools read, and it is 128 bits of
+# exactness for no gain. Its only dependency, `getrandom`, is already in the
+# tree.
+uuid = { version = "1", default-features = false, features = [
+    "std",
+    "v7",
+    "serde",
+] }
+
+# The encoding for the one part of a persisted message that is neither a
+# scalar nor a byte string: the header list. Headers repeat, keep their
+# order, and occasionally carry bytes that are not text, so they are stored
+# as the model's own JSON — deterministic, and readable by anything that
+# opens the database. Storing them as rows was the alternative and was
+# rejected: nothing queries a header, so it would be a table and a second
+# query for no benefit. Not new to the build: serde_json was already this
+# crate's test dependency and is in the tree.
+serde_json = "1"
+
+# The rule model this crate persists. Rules are a table of their own here,
+# and the strongly typed `Rule` is what goes into it and what comes back out;
+# a second rule model living in this crate would be two to keep in step. Not
+# a new third-party dependency: it is this workspace's own crate.
+rules = { path = "../rules" }
+
+[dev-dependencies]
+# Subscribers are awaited, so the event tests need a runtime, and a timeout to
+# fail on rather than hang on. The storage worker tests need the multi-thread
+# flavour, because the worker runs on a blocking thread of its own.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+
+# Temporary directories for the tests: every test opens a database of its own
+# under one and it is removed when the test ends, so no test writes to the
+# repository or to a developer's own traffic database. The alternative was
+# building unique paths under the system temporary directory by hand and
+# removing them in a guard, which is this crate reimplemented, badly.
+tempfile = "3"

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The bundle metadata for ProxyLab.app.
+
+  A Swift package builds a plain executable, which AppKit will run but will not
+  treat as an application: no Dock icon, no menu bar, no double-clicking it in
+  the Finder. `Scripts/make-app-bundle.sh` wraps that executable in a bundle
+  with this file in it, which is what makes it an application.
+
+  Nothing here asks for a capability. ProxyLab's window reads one Unix socket
+  in the user's own home directory: no network access, no camera, no files
+  outside what the user picks.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>ProxyLab</string>
+    <key>CFBundleDisplayName</key>
+    <string>ProxyLab</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.proxylab.ProxyLab</string>
+    <key>CFBundleExecutable</key>
+    <string>ProxyLab</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>

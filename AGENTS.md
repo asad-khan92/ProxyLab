@@ -59,3 +59,8 @@ architecturally stable while it grows.
 15. **Never silently change public interfaces or data models.**
     Changes to IPC messages, wire formats, persisted schemas, or public APIs
     must be called out explicitly in the change report.
+
+16.Do not modify files outside the repository unless explicitly instructed.
+   In particular, do not modify shell configuration files such as ~/.zshrc.
+
+17. Public API changes are allowed when required by the current task, but must be explicitly reported.    

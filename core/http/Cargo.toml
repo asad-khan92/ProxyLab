@@ -1,0 +1,36 @@
+[package]
+name = "proxy-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "ProxyLab HTTP: HTTP/1.1 and HTTP/2 parsing, framing, and message models."
+
+[dependencies]
+# The request model crosses the IPC boundary in both directions — a cURL
+# command is parsed into one, and one is sent to be replayed — so the schema
+# is the Rust type rather than two hand-written encodings that have to be kept
+# in step. Not a new dependency: serde is already in the tree.
+serde = { version = "1", features = ["derive"] }
+
+# URL and method validation. `http::Uri` and `http::Method` are the types the
+# proxy engine's HTTP library is itself built on, so a URL this crate accepts
+# is one hyper can put on a request line, and a method it accepts is one hyper
+# can send. Hand-rolling a URL parser was the alternative and was rejected: a
+# request URL is untrusted input, and the authority/path/query splitting is
+# exactly where a hand-rolled parser gets something wrong. Not a new
+# third-party dependency — `http` is already in the tree as hyper's own.
+http = "1"
+
+# The header model and the base64 encoding of a byte string. Headers repeat,
+# keep their order, and occasionally carry bytes that are not text, and
+# `proxy-storage` already spells all of that; a second header model here would
+# be two to keep in step, and the request this crate describes is turned into
+# a captured one the moment it is sent. Not a new third-party dependency: it
+# is this workspace's own crate.
+proxy-storage = { path = "../storage" }
+
+[dev-dependencies]
+# The tests that assert on the JSON a request is sent as: a request whose
+# encoding changed silently is a client the core can no longer read. Already
+# in the tree.
+serde_json = "1"

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The bundle metadata for ProxyLab's transparent proxy provider, a Network
+  Extension packaged as a system extension.
+
+  `Scripts/make-app-bundle.sh` copies this into
+  ProxyLab.app/Contents/Library/SystemExtensions/, replacing the two
+  placeholders:
+
+      __APP_BUNDLE_ID__   the app's bundle identifier
+      __TEAM_ID__         the Apple Developer team the two are signed by
+
+  `NetworkExtension` is what macOS reads to start it: the provider class to
+  instantiate for a transparent proxy (`app-proxy` is the category a
+  NETransparentProxyProvider belongs to), and the Mach service it is reached
+  on, which Apple requires to sit under an app group the extension is
+  entitled to.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>ProxyLab Transparent Proxy</string>
+    <key>CFBundleDisplayName</key>
+    <string>ProxyLab Transparent Proxy</string>
+    <key>CFBundleIdentifier</key>
+    <string>__APP_BUNDLE_ID__.TransparentProxy</string>
+    <key>CFBundleExecutable</key>
+    <string>ProxyLabTransparentProxy</string>
+    <key>CFBundlePackageType</key>
+    <string>SYSX</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>MacOSX</string>
+    </array>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSSystemExtensionUsageDescription</key>
+    <string>ProxyLab captures this Mac's HTTP and HTTPS traffic while you have transparent capture turned on, so you can inspect it without setting a proxy.</string>
+    <key>NetworkExtension</key>
+    <dict>
+        <key>NEMachServiceName</key>
+        <string>__TEAM_ID__.__APP_BUNDLE_ID__.TransparentProxy</string>
+        <key>NEProviderClasses</key>
+        <dict>
+            <key>com.apple.networkextension.app-proxy</key>
+            <string>ProxyLabTransparentProxyProvider</string>
+        </dict>
+    </dict>
+</dict>
+</plist>

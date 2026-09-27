@@ -65,4 +65,5 @@ Planned phases for **ProxyLab**.
 - Breakpoints
 - Throttling
 - HAR
+- Saved requests
 - Transparent proxy

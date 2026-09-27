@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  What the transparent proxy provider is signed with. Only a signed build uses
+  this file; `Scripts/make-app-bundle.sh` replaces the placeholders.
+
+  - networkextension / app-proxy-provider: the one provider type it is.
+    `app-proxy-provider` is the value for a development-signed build; a
+    Developer ID build would need `app-proxy-provider-systemextension`, which
+    is distribution and is not what this script produces.
+  - app-sandbox and network.client: a Network Extension provider runs
+    sandboxed, and it opens two kinds of outbound connection — to the core's
+    bridge on loopback, and straight to a destination when the core is not
+    there. It listens on nothing.
+  - application-groups: the group NEMachServiceName sits under.
+
+  Nothing here reaches the user's files, keychain, or preferences.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.application-identifier</key>
+    <string>__TEAM_ID__.__APP_BUNDLE_ID__.TransparentProxy</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>__TEAM_ID__</string>
+    <key>com.apple.developer.networking.networkextension</key>
+    <array>
+        <string>app-proxy-provider</string>
+    </array>
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>__TEAM_ID__.__APP_BUNDLE_ID__</string>
+    </array>
+</dict>
+</plist>

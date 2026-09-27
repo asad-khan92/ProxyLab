@@ -1,0 +1,37 @@
+[package]
+name = "rules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "ProxyLab rules: the rule model, matching, and the decision a request produces."
+
+[dependencies]
+# The rule model is persisted as JSON in the rules table and crosses the IPC
+# boundary as JSON, so the schema is the Rust types rather than two
+# hand-written encodings that have to be kept in step. Not a new dependency:
+# serde is already in the tree.
+serde = { version = "1", features = ["derive"] }
+
+# Durable rule ids. Version 7 for the same two reasons `ExchangeId` uses it:
+# an id is unique across runs of the proxy, and it is ordered by the moment it
+# was minted — which is what makes creation order a stable tie-break between
+# rules of equal priority without a second column to hold it. Already in the
+# tree as `proxy-storage`'s dependency.
+uuid = { version = "1", default-features = false, features = [
+    "std",
+    "v7",
+    "serde",
+] }
+
+# A Modify rule's JSON body edit: the body is parsed, one field is set, and
+# it is written back. Parsing JSON by hand was the alternative, and was
+# rejected for the reason nobody hand-rolls a TLS handshake here — it is the
+# part that would be wrong. Moved from a dev-dependency to a dependency; it
+# was already in the tree for the tests below and as `proxy-storage`'s and
+# `proxy-ipc`'s own, with the same features, so nothing new is built.
+serde_json = "1"
+
+[dev-dependencies]
+# The tests that assert on the JSON a rule is persisted and sent as: a rule
+# whose encoding changed silently is a rule an older database cannot read.
+# Already a dependency above.

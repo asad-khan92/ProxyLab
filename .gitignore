@@ -1,0 +1,42 @@
+.DS_Store
+.vscode/
+**/.build/
+**/target/
+.swiftpm/
+
+# Certificates and keys are generated on the machine that runs ProxyLab and
+# belong to that machine. The development CA lives outside the repository
+# (`~/.proxylab/ca` by default, or wherever `PROXYLAB_CA_DIR` points), so
+# these patterns are a safety net for the case where a developer points that
+# variable somewhere inside a checkout.
+#
+# A private key must never be committed. Neither should the CA certificate:
+# a shared CA is a CA everyone's machine trusts, which is exactly the thing
+# a development CA must not be.
+*.pem
+*.key
+*.p12
+*.pfx
+ca-cert.pem
+ca-key.pem
+
+# Captured traffic. The database and the body files are generated on the
+# machine that runs ProxyLab and live outside the repository
+# (`~/.proxylab/traffic` by default, or wherever `PROXYLAB_TRAFFIC_DIR`
+# points), so these patterns are a safety net for the case where a developer
+# points that variable somewhere inside a checkout.
+#
+# Captured traffic is whatever went through the proxy: credentials, cookies,
+# tokens, and request and response bodies. None of it belongs in version
+# control.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+bodies/
+
+# The IPC socket, for the same reason: it is created at runtime, it lives
+# outside the repository (`~/.proxylab/run` by default, or wherever
+# `PROXYLAB_IPC_SOCKET` points), and it is the way in to everything above.
+*.sock

@@ -1,0 +1,95 @@
+[package]
+name = "proxy-ipc"
+version.workspace = true
+edition.workspace = true
+# Raised above the workspace default because tokio 1.53 needs 1.71, and this
+# crate is built on tokio's Unix socket support.
+rust-version = "1.71"
+description = "ProxyLab IPC: the Unix socket server, message schema, and traffic event stream between the core and the UI."
+
+[dependencies]
+# The Unix domain socket listener, the per-client tasks, and the shutdown
+# signalling. `net` is what carries the socket itself; `io-util` reads and
+# writes the newline-delimited protocol; `rt` runs the connection tasks and
+# hands the synchronous database work to a blocking thread; `sync` is the
+# watch channel that tells connections to stop; `macros` is `select!`, which
+# is how one connection waits on its client and on the traffic event stream
+# at once. The standard library has Unix sockets but only blocking ones,
+# which would mean a thread per connection and no way to interrupt a client
+# that has stopped reading. Not a new dependency: tokio is already in the
+# tree.
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+] }
+
+# The wire format. Every request and response is a JSON object, and the
+# models are serde structures so the schema is the Rust types rather than
+# hand-written encoding. Not new to the build: both are already in the tree.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The traffic model, the stored history, and the event stream finished
+# exchanges are published on. Everything IPC serves comes from there — this
+# crate runs no queries of its own. Not a new third-party dependency: it is
+# this workspace's own crate.
+proxy-storage = { path = "../storage" }
+
+# The cURL parser and serializer. `parse_curl` reads a command into a
+# request and `curl_from_traffic` writes a stored request out as one; neither
+# is done here, because what a cURL command may say is not a property of the
+# IPC boundary. Not a new third-party dependency: this workspace's own crate.
+proxy-curl = { path = "../curl" }
+
+# Writing captured traffic out as HAR and reading a HAR file back in.
+# `export_har` and `import_har` name a file and this crate carries the
+# request for it; what HAR 1.2 is, and how an exchange is spelled as an
+# entry, is not a property of the IPC boundary. Not a new third-party
+# dependency: this workspace's own crate.
+proxy-har = { path = "../har" }
+
+# The canonical request a replay carries and a parsed command produces.
+# Checking it is that crate's job, so a request this server accepts is one the
+# engine can send — there is no second idea here of what a URL may be. Not a
+# new third-party dependency: this workspace's own crate.
+proxy-http = { path = "../http" }
+
+# Breakpoint and pause identifiers. A breakpoint keeps its identity for as
+# long as it is configured and a pause names one exchange being held still,
+# and both are minted by the server and quoted back by a client — which is
+# what a `RuleId` and an `ExchangeId` already are, minted the same way and for
+# the same two reasons: unique across runs, and ordered by the moment they
+# were minted. Hand-rolling a counter was the alternative and was rejected: a
+# counter collides across restarts, and a pause id that is reused is a client
+# answering the wrong exchange. Not a new third-party dependency — uuid is
+# already in the tree as `rules`' and `proxy-storage`'s own.
+uuid = { version = "1", default-features = false, features = [
+    "std",
+    "v7",
+    "serde",
+] }
+
+# The rule model the rule operations carry. The protocol sends rules as the
+# `rules` crate spells them, for the same reason it sends exchanges as
+# `proxy-storage` spells them: one model, not two to keep in step. Not a new
+# third-party dependency — it is this workspace's own crate.
+rules = { path = "../rules" }
+
+[dev-dependencies]
+# The test clients: connecting to the socket, reading and writing lines, and
+# timeouts so a server that never answers fails the suite instead of hanging
+# it. The multi-thread flavour is needed because the server, its clients, and
+# the blocking database work all run at once.
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+# A temporary directory per test for the socket and the database, removed
+# with the test, so no test writes to a fixed path or to a developer's own
+# traffic. Already in the tree as `proxy-storage`'s test dependency.
+tempfile = "3"
+
+# The tests read a replayed body back out of the base64 the wire carries it
+# as, and write one in. Already in the tree as `proxy-storage`'s dependency.
+base64 = "0.23"

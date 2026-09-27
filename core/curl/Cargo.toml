@@ -1,0 +1,37 @@
+[package]
+name = "proxy-curl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "ProxyLab cURL: cURL command export and import."
+
+[dependencies]
+# The request a cURL command describes, and the request a cURL command is
+# written from. Parsing produces one and serializing consumes one, so there is
+# no request model in this crate: a URL this crate accepts is a URL the engine
+# can send, because it is the same check. Not a new third-party dependency —
+# it is this workspace's own crate.
+proxy-http = { path = "../http" }
+
+# The header model and the captured request a `Copy as cURL` is written from.
+# Headers repeat and keep their order, and a captured body is bytes; both are
+# already spelled there. Not a new third-party dependency: this workspace's
+# own crate.
+proxy-storage = { path = "../storage" }
+
+# `--user ada:secret` is an `Authorization: Basic` header, and Basic
+# authentication is base64. Writing a base64 encoder by hand was the
+# alternative and was rejected for the usual reason: it is a wire format, and
+# a subtly wrong one produces a credential a server rejects for no visible
+# reason. Already in the tree as `proxy-storage`'s own dependency.
+base64 = "0.23"
+
+# The parse result crosses the IPC boundary — a parsed command comes back as
+# the request it describes plus what the parser has to say about it — so the
+# schema is the Rust types. Not a new dependency: serde is already in the tree.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# The tests that assert on the JSON a parse result is sent as. Already in the
+# tree.
+serde_json = "1"

@@ -1,0 +1,5 @@
+# Swift package build output and Xcode's own package state. Both are produced
+# by building and belong to the machine that built them.
+.build/
+.swiftpm/
+*.xcodeproj
