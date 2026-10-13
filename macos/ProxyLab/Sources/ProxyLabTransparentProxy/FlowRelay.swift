@@ -7,6 +7,11 @@
 //                        ▼                              ▼
 //                  core unreachable ─────────▶ carry it directly ──▶ copy bytes
 //
+//  A connection that is only waiting has not failed. The bridge is given up
+//  on when nothing is listening; the direct connection is left alone until
+//  it is ready or has failed. Ending either one on the wait that follows
+//  the provider being enabled drops a flow this provider already claimed.
+//
 //  The flow is opened towards the application only once there is somewhere
 //  for its bytes to go, so an application whose destination was refused sees
 //  its connection fail rather than succeed and then go silent.
@@ -122,15 +127,16 @@ final class FlowRelay: @unchecked Sendable {
         bridge.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
 
-            switch state {
-            case .ready:
+            switch RelayConnectionPolicy.bridge(Self.condition(state)) {
+            case .proceed:
                 self.handshake(on: bridge, request: request)
-            case let .waiting(error), let .failed(error):
-                // Refused, most likely: the core is not running. `.waiting`
-                // is how a refused loopback connection shows itself, and
-                // waiting for a network change will not start the core.
-                self.bridgeUnreachable(bridge, reason: Self.describe(error))
-            default:
+            case .giveUp:
+                // Refused, or failed outright: the core is not running.
+                // `.waiting` with `ECONNREFUSED` is how a closed loopback
+                // port shows itself. A wait for any other reason is the
+                // route settling, and cancelling there drops the flow.
+                self.bridgeUnreachable(bridge, reason: Self.describe(Self.socketError(state)))
+            case .wait:
                 break
             }
         }
@@ -138,7 +144,9 @@ final class FlowRelay: @unchecked Sendable {
     }
 
     private func handshake(on bridge: NWConnection, request: Data) {
-        guard !connected, !finished else { return }
+        // A bridge that was already given up on can still report ready.
+        // The direct connection is the one the flow is using by then.
+        guard !connected, !finished, connection === bridge else { return }
         connected = true
 
         bridge.send(content: request, completion: .contentProcessed { [weak self] error in
@@ -221,14 +229,17 @@ final class FlowRelay: @unchecked Sendable {
         direct.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
 
-            switch state {
-            case .ready:
-                guard !self.connected else { return }
+            switch RelayConnectionPolicy.direct(Self.condition(state)) {
+            case .proceed:
+                guard !self.connected, self.connection === direct else { return }
                 self.connected = true
                 self.relay(through: direct, leftover: Data())
-            case .waiting, .failed:
+            case .giveUp:
                 self.finish(error: NEAppProxyFlowError(.hostUnreachable))
-            default:
+            case .wait:
+                // The route is not up yet. The flow stays claimed until it
+                // is, or until the connection fails. Ending it here is the
+                // Mac losing a connection this provider already took.
                 break
             }
         }
@@ -361,7 +372,7 @@ final class FlowRelay: @unchecked Sendable {
     }
 
     /// A sentence for the status the app is shown. No address, no host.
-    private static func describe(_ error: NWError) -> String {
+    private static func describe(_ error: NWError?) -> String {
         switch error {
         case .posix(.ECONNREFUSED):
             "the core is not listening on its bridge port"
@@ -369,6 +380,35 @@ final class FlowRelay: @unchecked Sendable {
             "the bridge connection failed (\(code.rawValue))"
         default:
             "the bridge connection failed"
+        }
+    }
+
+    /// The part of a connection state the policy knows about.
+    private static func condition(_ state: NWConnection.State) -> RelaySocketCondition {
+        switch state {
+        case .ready:
+            return .ready
+        case let .waiting(error):
+            return .waiting(failure(error))
+        case let .failed(error):
+            return .failed(failure(error))
+        default:
+            return .other
+        }
+    }
+
+    private static func failure(_ error: NWError) -> RelaySocketFailure {
+        if case .posix(.ECONNREFUSED) = error { return .refused }
+
+        return .other
+    }
+
+    private static func socketError(_ state: NWConnection.State) -> NWError? {
+        switch state {
+        case let .waiting(error), let .failed(error):
+            return error
+        default:
+            return nil
         }
     }
 }

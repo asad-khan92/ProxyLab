@@ -34,6 +34,62 @@ public enum RuleDisplay {
         return parts.isEmpty ? "Every request" : parts.joined(separator: " · ")
     }
 
+    /// The matcher as the rules list and the traffic-rule chooser both read it.
+    ///
+    /// Method, then host and path, the way a request is read:
+    /// `GET api.example.com/products`. A prefix path keeps the star the list
+    /// already uses. A matcher that sets nothing says so.
+    static func chooserMatch(_ matcher: RuleMatcher) -> String {
+        var location = matcher.host?.text ?? ""
+        if let path = matcher.path {
+            location += path.isPrefix ? "\(path.text)*" : path.text
+        }
+        let method = matcher.method?.text.uppercased() ?? ""
+        let line = [method, location].filter { !$0.isEmpty }.joined(separator: " ")
+
+        return line.isEmpty ? "Every request" : line
+    }
+
+    /// Where the action sends a match, or what it changes, on one line.
+    ///
+    /// Shared by the rules list and the traffic-rule chooser.
+    ///
+    /// Header values are left out, the same way the rule list leaves them
+    /// out. An action with nothing to point at — Allow, or a Modify rule
+    /// that changes nothing — returns nil, and the chooser shows the match
+    /// alone.
+    static func chooserTarget(_ action: RuleAction) -> String? {
+        switch action {
+        case .allow:
+            return nil
+        case let .block(block):
+            return "Answered \(block.status)"
+        case let .mapLocal(map):
+            let name = fileName(of: map.path)
+            return name.isEmpty ? nil : "→ \(name)"
+        case let .mapRemote(target):
+            return "→ \(destinationSummary(target))"
+        case let .redirect(redirect):
+            return "\(redirect.status) → \(destinationSummary(redirect.target))"
+        case let .modifyRequest(modify):
+            let parts = changes(of: modify)
+            return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        case let .modifyResponse(modify):
+            let parts = changes(of: modify)
+            return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        }
+    }
+
+    /// Host, port when it is not the scheme's own, and path when the rule names one.
+    private static func destinationSummary(_ target: RemoteTarget) -> String {
+        var text = target.authority
+        if let path = target.path, !path.isEmpty, path != "/" {
+            text += path
+        }
+
+        return text
+    }
+
     /// What the action does with a matching request, in a few words.
     public static func actionSummary(_ action: RuleAction) -> String {
         switch action {

@@ -50,6 +50,7 @@ public struct BreakpointsView: View {
                 .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 420)
         } detail: {
             detail
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .navigationTitle("ProxyLab")
         .navigationSubtitle("Breakpoints")
@@ -63,10 +64,16 @@ public struct BreakpointsView: View {
     // MARK: - The sidebar
 
     private var sidebar: some View {
-        VStack(spacing: 0) {
+        // The same shape as the traffic sidebar: the list takes the room the
+        // throttling controls do not need, and those controls scroll if a
+        // short window cannot show them whole.
+        BottomPinnedColumn(minimumContentHeight: 80) {
             list
-            Divider()
-            ThrottleControls(model: model)
+        } footer: {
+            VStack(spacing: 0) {
+                Divider()
+                ThrottleControls(model: model)
+            }
         }
     }
 
@@ -79,16 +86,15 @@ public struct BreakpointsView: View {
             PlaceholderView(
                 symbol: "exclamationmark.triangle",
                 title: "The breakpoints could not be loaded",
-                detail: reason,
+                detail: UserFacingNotice(reason).summary,
                 action: ("Try Again", { Task { await model.load() } })
             )
         default:
             if model.breakpoints.isEmpty {
                 PlaceholderView(
                     symbol: "pause.circle",
-                    title: "No breakpoints",
-                    detail: "A breakpoint holds a matching request or response still so you "
-                        + "can change it before it goes on. Everything else is carried as usual."
+                    title: BreakpointEmptyCopy.title,
+                    detail: BreakpointEmptyCopy.detail
                 )
             } else {
                 List {
@@ -101,7 +107,7 @@ public struct BreakpointsView: View {
                                     }
                                 }
                                 Divider()
-                                Button("Delete", role: .destructive) {
+                                Button("Delete Breakpoint", role: .destructive) {
                                     Task { await model.delete(breakpoint) }
                                 }
                             }
@@ -118,6 +124,7 @@ public struct BreakpointsView: View {
     private var detail: some View {
         if let editor = model.editor {
             PauseEditorView(editor: editor, model: model)
+                .id(editor.paused.pauseID)
         } else if !model.watching {
             PlaceholderView(
                 symbol: "pause.circle.fill",
@@ -174,12 +181,7 @@ public struct BreakpointsView: View {
                 .foregroundStyle(.secondary)
 
             if let error = model.lastError {
-                Text(error)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.red)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .help(error)
+                StatusNotice(message: error)
             } else if let action = model.lastAction {
                 Text(action)
                     .font(.system(size: 11))

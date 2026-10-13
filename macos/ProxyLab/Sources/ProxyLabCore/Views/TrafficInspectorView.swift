@@ -8,11 +8,13 @@
 //      │ All Traff │ GET  example │ GET https://example.com/… │
 //      │ PINNED    │ POST api/…   │ ┌ Request ┬ Response ┐    │
 //      │  api.exa… │ GET  api/…   │ │ headers, body, timing   │
+//      │ DOMAINS   │              │                           │
+//      │  cdn.exa… │              │                           │
 //      ├───────────┤              │                           │
-//      │ iOS SIM   │              │                           │
-//      │ ANDROID   │              │                           │
-//      │ IPHONE    │              │                           │
-//      │ THIS MAC  │              │                           │
+//      │ CAPTURE   │              │                           │
+//      │  ● Mac    │              │                           │
+//      │  ● iPhone │              │                           │
+//      │  ○ Android│              │                           │
 //      ├───────────┴──────────────┴───────────────────────────┤
 //      │ 12 of 12 requests                        Clear All   │
 //      └──────────────────────────────────────────────────────┘
@@ -30,95 +32,110 @@ import SwiftUI
 /// ProxyLab's traffic inspector.
 public struct TrafficInspectorView: View {
     private let model: TrafficInspectorModel
+    private let breakpoints: BreakpointsModel
+    private let rules: RulesModel
     private let saved: SavedRequestsModel
     private let pinned: PinnedDomainsStore
     private let simulator: SimulatorSessionModel
     private let android: AndroidSessionModel
     private let iPhone: IPhoneSetupModel
     private let transparent: TransparentProxyModel
+    private let lifecycle: CaptureLifecycle
+    /// Menus and shortcuts. Nil in a preview that has no menu bar.
+    private let commands: AppCommandRouter?
 
     /// Which of the window's two screens is showing. Held by the window and
     /// changed through the control this view puts in the toolbar.
     @Binding private var section: AppSection
 
     @State private var confirmingClear = false
+    @FocusState private var searchFocused: Bool
 
     public init(
         model: TrafficInspectorModel,
+        breakpoints: BreakpointsModel,
+        rules: RulesModel,
         saved: SavedRequestsModel,
         pinned: PinnedDomainsStore,
         simulator: SimulatorSessionModel,
         android: AndroidSessionModel,
         iPhone: IPhoneSetupModel,
         transparent: TransparentProxyModel,
+        lifecycle: CaptureLifecycle,
         section: Binding<AppSection>
     ) {
+        self.init(
+            model: model,
+            breakpoints: breakpoints,
+            rules: rules,
+            saved: saved,
+            pinned: pinned,
+            simulator: simulator,
+            android: android,
+            iPhone: iPhone,
+            transparent: transparent,
+            lifecycle: lifecycle,
+            section: section,
+            commands: nil
+        )
+    }
+
+    init(
+        model: TrafficInspectorModel,
+        breakpoints: BreakpointsModel,
+        rules: RulesModel,
+        saved: SavedRequestsModel,
+        pinned: PinnedDomainsStore,
+        simulator: SimulatorSessionModel,
+        android: AndroidSessionModel,
+        iPhone: IPhoneSetupModel,
+        transparent: TransparentProxyModel,
+        lifecycle: CaptureLifecycle,
+        section: Binding<AppSection>,
+        commands: AppCommandRouter?
+    ) {
         self.model = model
+        self.breakpoints = breakpoints
+        self.rules = rules
         self.saved = saved
         self.pinned = pinned
         self.simulator = simulator
         self.android = android
         self.iPhone = iPhone
         self.transparent = transparent
+        self.lifecycle = lifecycle
+        self.commands = commands
         _section = section
     }
 
     public var body: some View {
-        NavigationSplitView {
-            PinnedDomainsView(model: model, pinned: pinned)
-                .safeAreaInset(edge: .bottom, spacing: 0) {
-                    // The sidebar's foot rather than rows in its list: the
-                    // list's rows are hosts to filter by, and none of these
-                    // is one. The simulator first because it is the one that
-                    // needs no network setup at all, then the emulator, which
-                    // needs one setting, then the iPhone, which needs the
-                    // core put on the local network.
-                    VStack(spacing: 0) {
-                        // Above the device panels: a saved request is about
-                        // the traffic this screen shows, and the three below
-                        // it are about where traffic comes from.
-                        SavedRequestsSectionView(
-                            model: saved,
-                            coreConnected: model.connection == .connected
-                        )
-                        SimulatorSectionView(
-                            model: simulator,
-                            coreConnected: model.connection == .connected
-                        )
-                        AndroidSectionView(
-                            model: android,
-                            coreConnected: model.connection == .connected
-                        )
-                        IPhoneSectionView(
-                            model: iPhone,
-                            coreConnected: model.connection == .connected
-                        )
-                        // Last: every panel above points a device at the
-                        // proxy, and this one points the Mac itself at it,
-                        // which is the one with the widest consequence.
-                        TransparentProxySectionView(
-                            model: transparent,
-                            coreConnected: model.connection == .connected
-                        )
-                    }
-                }
-                .navigationSplitViewColumnWidth(min: 200, ideal: 230, max: 340)
-        } content: {
-            TrafficListView(model: model, pinned: pinned, selection: selection)
-                .navigationSplitViewColumnWidth(min: 280, ideal: 340, max: 520)
-        } detail: {
-            TrafficDetailView(model: model)
+        // The status bar is a sibling of the split view. An inset drawn over
+        // the columns left the last capture-source row underneath it, and the
+        // footer then believed that row was already on screen.
+        VStack(spacing: 0) {
+            columns
+            statusBar
         }
-        .navigationTitle("ProxyLab")
-        .navigationSubtitle(subtitle)
-        .toolbar { toolbar }
-        .safeAreaInset(edge: .bottom, spacing: 0) { statusBar }
         .task { await model.start() }
+        .onChange(of: model.selectedID) { _, id in
+            // Choosing a captured row leaves the hold on screen only in the
+            // list. The pause itself stays until it is continued or dropped.
+            if id != nil { breakpoints.dismissHoldInspector() }
+        }
+        .background {
+            if let commands {
+                TrafficCommandSignal(commands: commands) {
+                    searchFocused = true
+                } clear: {
+                    confirmingClear = true
+                }
+            }
+        }
         .confirmationDialog(
             "Clear all captured traffic?",
             isPresented: $confirmingClear
         ) {
-            Button("Clear All Traffic", role: .destructive) {
+            Button("Clear Traffic", role: .destructive) {
                 Task { await model.clearAll() }
             }
             Button("Cancel", role: .cancel) {}
@@ -135,6 +152,13 @@ public struct TrafficInspectorView: View {
                 SavedRequestSheet(editor: editor, model: saved)
             }
         }
+        .sheet(isPresented: trafficRuleBinding) {
+            if let request = rules.trafficRule {
+                RuleChooserSheet(model: rules, request: request) { id in
+                    await model.capturedExchange(id: id)
+                }
+            }
+        }
         .sheet(isPresented: savePromptBinding) {
             if saved.saving != nil {
                 SaveRequestSheet(
@@ -146,6 +170,62 @@ public struct TrafficInspectorView: View {
                 )
             }
         }
+        .sheet(isPresented: iPhoneInstructions) {
+            IPhoneSetupSheet(model: iPhone)
+        }
+    }
+
+    private var columns: some View {
+        NavigationSplitView {
+            TrafficSidebarColumn(
+                model: model,
+                saved: saved,
+                pinned: pinned,
+                simulator: simulator,
+                android: android,
+                iPhone: iPhone,
+                transparent: transparent,
+                lifecycle: lifecycle
+            )
+            .navigationSplitViewColumnWidth(min: 200, ideal: 230, max: 340)
+        } content: {
+            TrafficListView(
+                model: model,
+                breakpoints: breakpoints,
+                saved: saved,
+                pinned: pinned,
+                selection: selection,
+                searchFocused: $searchFocused
+            ) { kind, summary in
+                rules.beginTrafficRule(
+                    TrafficRuleRequest(
+                        kind: kind,
+                        exchangeID: summary.id,
+                        seed: RuleDraftSeed.from(summary: summary, kind: kind)
+                    )
+                )
+            }
+            .navigationSplitViewColumnWidth(min: 280, ideal: 340, max: 520)
+        } detail: {
+            TrafficDetailView(
+                model: model,
+                saved: saved,
+                rules: rules,
+                breakpoints: breakpoints
+            )
+        }
+        .navigationTitle("ProxyLab")
+        .navigationSubtitle(subtitle)
+        .toolbar { toolbar }
+    }
+
+    /// The physical-iPhone certificate steps. Hosted here so the sheet is not
+    /// opened from inside the source popover.
+    private var iPhoneInstructions: Binding<Bool> {
+        Binding(
+            get: { iPhone.showingInstructions },
+            set: { iPhone.showingInstructions = $0 }
+        )
     }
 
     /// Whether the saved request editor is up. Set only to close it.
@@ -161,6 +241,20 @@ public struct TrafficInspectorView: View {
         Binding(
             get: { saved.saving != nil },
             set: { showing in if !showing { saved.cancelSave() } }
+        )
+    }
+
+    /// Whether the rule chooser is up. Closing it drops the draft; nothing
+    /// has been sent.
+    private var trafficRuleBinding: Binding<Bool> {
+        Binding(
+            get: { rules.trafficRule != nil },
+            set: { showing in
+                if !showing {
+                    rules.cancelEditing()
+                    rules.cancelTrafficRule()
+                }
+            }
         )
     }
 
@@ -213,6 +307,15 @@ public struct TrafficInspectorView: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
+            CaptureSourcesToolbar(
+                simulator: simulator,
+                android: android,
+                iPhone: iPhone,
+                transparent: transparent,
+                coreConnected: model.connection == .connected,
+                lifecycle: lifecycle
+            )
+
             Menu {
                 Button("Export Selected…") {
                     Task { await model.exportSelectedAsHar() }
@@ -269,7 +372,6 @@ public struct TrafficInspectorView: View {
                 Label("Delete Exchange", systemImage: "trash")
             }
             .disabled(model.selectedID == nil)
-            .keyboardShortcut(.delete, modifiers: [])
             .help("Delete the selected exchange")
 
             Button {
@@ -289,12 +391,7 @@ public struct TrafficInspectorView: View {
                 .foregroundStyle(.secondary)
 
             if let error = model.lastError ?? saved.lastError {
-                Text(error)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.red)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .help(error)
+                StatusNotice(message: error)
             } else if let action = model.lastAction ?? saved.lastAction {
                 Text(action)
                     .font(.system(size: 11))
@@ -313,8 +410,9 @@ public struct TrafficInspectorView: View {
                 .truncationMode(.head)
                 .help("The IPC socket this window is reading from")
 
-            Button("Clear All") { confirmingClear = true }
+            Button("Clear Traffic") { confirmingClear = true }
                 .controlSize(.small)
+                .help("Remove every stored exchange")
                 // Enabled whenever the core is answering: a filter that hides
                 // every row does not mean there is nothing stored to clear.
                 .disabled(model.connection != .connected)
@@ -346,5 +444,41 @@ public struct TrafficInspectorView: View {
         }
 
         return "\(listed) \(noun)"
+    }
+}
+
+/// The domains, and under them saved requests and the capture sources.
+///
+/// A source row opens its setup. It is not a host, so selecting one does not
+/// change the traffic filter the domain list owns.
+private struct TrafficSidebarColumn: View {
+    let model: TrafficInspectorModel
+    let saved: SavedRequestsModel
+    let pinned: PinnedDomainsStore
+    let simulator: SimulatorSessionModel
+    let android: AndroidSessionModel
+    let iPhone: IPhoneSetupModel
+    let transparent: TransparentProxyModel
+    let lifecycle: CaptureLifecycle
+
+    var body: some View {
+        BottomPinnedColumn(minimumContentHeight: 120) {
+            PinnedDomainsView(model: model, pinned: pinned)
+        } footer: {
+            VStack(spacing: 0) {
+                SavedRequestsSectionView(
+                    model: saved,
+                    coreConnected: model.connection == .connected
+                )
+                CaptureSourcesSection(
+                    simulator: simulator,
+                    android: android,
+                    iPhone: iPhone,
+                    transparent: transparent,
+                    lifecycle: lifecycle,
+                    coreConnected: model.connection == .connected
+                )
+            }
+        }
     }
 }

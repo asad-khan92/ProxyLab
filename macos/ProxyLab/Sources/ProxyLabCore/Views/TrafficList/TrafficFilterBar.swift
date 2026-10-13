@@ -18,36 +18,52 @@ import SwiftUI
 /// Search, filters, and sort, above the list.
 struct TrafficFilterBar: View {
     let model: TrafficInspectorModel
+    var searchFocused: FocusState<Bool>.Binding
 
     var body: some View {
         VStack(spacing: 6) {
             searchField
 
-            HStack(spacing: 6) {
-                methodMenu
-                statusMenu
-                contentTypeMenu
-                versionMenu
-                kindMenu
-                hostMenu
-
-                Spacer(minLength: 4)
-
-                sortMenu
-
-                if model.filters.isNarrowed {
-                    Button("Clear") {
-                        Task { await model.clearFilters() }
-                    }
-                    .controlSize(.small)
-                    .help("Clear the search and every filter")
+            // The menus are as wide as their titles. In a narrow list column
+            // they scroll sideways rather than drawing past the column; when
+            // they fit, sort stays at the trailing edge.
+            ViewThatFits(in: .horizontal) {
+                filterControls(alignSortToTrailing: true)
+                ScrollView(.horizontal) {
+                    filterControls(alignSortToTrailing: false)
                 }
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(.bar)
         .overlay(alignment: .bottom) { Divider() }
+    }
+
+    private func filterControls(alignSortToTrailing: Bool) -> some View {
+        HStack(spacing: 6) {
+            methodMenu
+            statusMenu
+            contentTypeMenu
+            versionMenu
+            kindMenu
+            hostMenu
+
+            if alignSortToTrailing {
+                Spacer(minLength: 4)
+            }
+
+            sortMenu
+
+            if model.filters.isNarrowed {
+                Button("Clear") {
+                    Task { await model.clearFilters() }
+                }
+                .controlSize(.small)
+                .help("Clear the search and every filter")
+            }
+        }
     }
 
     // MARK: - Search
@@ -61,6 +77,7 @@ struct TrafficFilterBar: View {
             TextField("Search URL, headers, body, or messages", text: search)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
+                .focused(searchFocused)
                 .onSubmit { Task { await model.applySearchNow() } }
                 .accessibilityLabel("Search traffic")
 
@@ -73,6 +90,8 @@ struct TrafficFilterBar: View {
             }
             .buttonStyle(.plain)
             .help("Treat the search as a regular expression")
+            .accessibilityLabel("Regular expression")
+            .accessibilityValue(model.filters.searchRegex ? "On" : "Off")
 
             Button {
                 Task { await model.setSearchCaseSensitive(!model.filters.searchCaseSensitive) }
@@ -85,6 +104,8 @@ struct TrafficFilterBar: View {
             }
             .buttonStyle(.plain)
             .help("Match letter case")
+            .accessibilityLabel("Match case")
+            .accessibilityValue(model.filters.searchCaseSensitive ? "On" : "Off")
 
             if !model.filters.search.isEmpty {
                 Button {
@@ -99,6 +120,7 @@ struct TrafficFilterBar: View {
                 }
                 .buttonStyle(.plain)
                 .help("Clear the search")
+                .accessibilityLabel("Clear search")
             }
         }
         .padding(.horizontal, 8)

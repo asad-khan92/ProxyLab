@@ -12,11 +12,11 @@
 //  crashing, or losing its socket cannot strand a request — there is no
 //  timeout here to get right and no state to reconcile.
 //
-//  # One pause at a time on screen
+//  # Several pauses, one of them on screen
 //
 //  Pauses arrive as events and are kept in the order they arrived. The editor
-//  shows the first of them, because a person answers one exchange at a time;
-//  the rest wait, and the count says how many. A pause the core releases —
+//  shows one of them. The first to arrive is that one until a person picks
+//  another; a later arrival does not replace it. A pause the core releases —
 //  because it timed out, or because another window answered it — is taken off
 //  the queue when the `breakpoint_released` event says so, so the editor never
 //  offers a decision about something that is no longer being held.
@@ -54,8 +54,18 @@ public final class BreakpointsModel {
     public private(set) var throttle: ThrottleSettings = .none
     /// The exchanges being held right now, oldest first.
     public private(set) var paused: [PausedExchange] = []
-    /// The edits being made to the pause on screen, if there is one.
-    public private(set) var editor: PauseEditorModel?
+    /// Which held exchange the editor is showing, when one has been chosen.
+    private var selectedPauseID: String?
+    /// The edits for each held exchange, so choosing another one does not
+    /// throw away what was already typed.
+    private var editors: [String: PauseEditorModel] = [:]
+    /// Whether the traffic detail should show the held exchange.
+    ///
+    /// Set when the first pause of a quiet queue arrives, and when a person
+    /// asks to see one. A later pause does not set it again.
+    private(set) var showingHold = false
+    /// The breakpoint being written from a traffic row, if that sheet is open.
+    var trafficDraft: TrafficBreakpointDraft?
     /// The last thing that went wrong, for the status bar.
     public private(set) var lastError: String?
     /// The last thing that happened, for the status bar.
@@ -75,10 +85,25 @@ public final class BreakpointsModel {
     }
 
     /// The pause a person is being asked about, if there is one.
-    public var current: PausedExchange? { paused.first }
+    ///
+    /// The one they selected, or the oldest when they have not selected.
+    public var current: PausedExchange? {
+        if let selectedPauseID, let selected = paused.first(where: { $0.pauseID == selectedPauseID }) {
+            return selected
+        }
+
+        return paused.first
+    }
+
+    /// The edits for the pause on screen, if there is one.
+    public var editor: PauseEditorModel? {
+        guard let pauseID = current?.pauseID else { return nil }
+
+        return editors[pauseID]
+    }
 
     /// How many exchanges are waiting behind the one on screen.
-    public var queuedCount: Int { max(paused.count - 1, 0) }
+    public var queuedCount: Int { max(paused.count - (current == nil ? 0 : 1), 0) }
 
     /// How many breakpoints are enabled.
     public var enabledCount: Int { breakpoints.count { $0.enabled } }
@@ -144,17 +169,42 @@ public final class BreakpointsModel {
     public func connectionLost() {
         watching = false
         paused = []
-        editor = nil
+        editors = [:]
+        selectedPauseID = nil
+        showingHold = false
     }
 
     // MARK: - Events
 
     /// Takes in one exchange the core has just paused.
+    ///
+    /// The first pause of an empty queue is the one on screen. A pause that
+    /// arrives while another is already showing is kept, and left off screen
+    /// until it is chosen.
     public func received(_ exchange: PausedExchange) {
         guard !paused.contains(where: { $0.pauseID == exchange.pauseID }) else { return }
 
+        let first = paused.isEmpty
         paused.append(exchange)
-        openEditorIfNeeded()
+        if first {
+            show(exchange)
+            showingHold = true
+        }
+    }
+
+    /// Shows `pauseID` and keeps every other held exchange.
+    func selectPause(_ pauseID: String) {
+        guard let exchange = paused.first(where: { $0.pauseID == pauseID }) else { return }
+
+        show(exchange)
+        showingHold = true
+    }
+
+    /// Leaves the traffic detail on the selected exchange.
+    ///
+    /// The pause stays held. The Breakpoints screen still has the editor.
+    func dismissHoldInspector() {
+        showingHold = false
     }
 
     /// Takes one exchange off the queue, because the core is not holding it
@@ -162,11 +212,16 @@ public final class BreakpointsModel {
     public func released(pauseID: String, reason: ReleaseReason) {
         let wasCurrent = current?.pauseID == pauseID
         paused.removeAll { $0.pauseID == pauseID }
+        editors[pauseID] = nil
+
+        if paused.isEmpty {
+            selectedPauseID = nil
+            showingHold = false
+        } else if wasCurrent, let next = paused.first {
+            show(next)
+        }
 
         if wasCurrent {
-            editor = nil
-            openEditorIfNeeded()
-
             switch reason {
             case .continued, .cancelled:
                 break
@@ -178,11 +233,12 @@ public final class BreakpointsModel {
         }
     }
 
-    /// Opens the editor on the pause at the front of the queue.
-    private func openEditorIfNeeded() {
-        guard editor == nil, let current else { return }
-
-        editor = PauseEditorModel(current)
+    /// Remembers an editor for `exchange` and makes it the one on screen.
+    private func show(_ exchange: PausedExchange) {
+        if editors[exchange.pauseID] == nil {
+            editors[exchange.pauseID] = PauseEditorModel(exchange)
+        }
+        selectedPauseID = exchange.pauseID
     }
 
     // MARK: - Deciding
@@ -203,6 +259,25 @@ public final class BreakpointsModel {
                 request: edits.request,
                 response: edits.response,
                 websocket: edits.websocket
+            )
+        }
+    }
+
+    /// Lets the exchange on screen carry on as it was captured.
+    ///
+    /// Whatever is typed in the editor is left unsent. A field the core is
+    /// not given stays as it was, which is also how a body too long to edit
+    /// is forwarded in full.
+    @discardableResult
+    public func continueUnchanged() async -> Bool {
+        guard let current else { return false }
+
+        return await decide(current.pauseID) { [session] in
+            try await session.continueBreakpoint(
+                pauseID: current.pauseID,
+                request: nil,
+                response: nil,
+                websocket: nil
             )
         }
     }
@@ -261,6 +336,59 @@ public final class BreakpointsModel {
 
             return true
         } catch {
+            lastError = message(for: error)
+
+            return false
+        }
+    }
+
+    /// Opens the sheet that writes a breakpoint from one captured exchange.
+    ///
+    /// The exchange itself is left alone. The draft matches the next request
+    /// that looks like it.
+    func beginBreakpoint(from summary: ExchangeSummary) {
+        trafficDraft = TrafficBreakpointDraft.from(summary: summary)
+    }
+
+    /// Drops the traffic sheet without configuring anything.
+    func cancelTrafficDraft() {
+        trafficDraft = nil
+    }
+
+    /// Configures the draft, one breakpoint per direction, through the same
+    /// create the Breakpoints screen uses.
+    ///
+    /// Request and response are two breakpoints because a breakpoint has one
+    /// direction. Both stay until they are disabled or deleted.
+    @discardableResult
+    func createTrafficDraft() async -> Bool {
+        guard let draft = trafficDraft else { return false }
+
+        if let refusal = draft.refusal {
+            lastError = refusal
+
+            return false
+        }
+
+        let matcher = draft.matcher
+        let directions = draft.directions
+
+        do {
+            for direction in directions {
+                _ = try await session.createBreakpoint(
+                    NewBreakpoint(direction: direction, matcher: matcher)
+                )
+            }
+            trafficDraft = nil
+            await load()
+            lastError = nil
+            lastAction = directions.count > 1
+                ? "The next matching request will pause, and then its response can."
+                : "The next matching \(directions[0].title.lowercased()) will pause."
+
+            return true
+        } catch {
+            await load()
             lastError = message(for: error)
 
             return false

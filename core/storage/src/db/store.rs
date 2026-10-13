@@ -20,21 +20,30 @@
 //! owns a blocking thread and a bounded queue so no proxy task ever waits on
 //! a database.
 //!
-//! # One connection
+//! # Two connections, one writer
 //!
-//! A [`Storage`] holds one connection behind a mutex, and cloning one shares
-//! it. So writes and reads inside this process take turns, which SQLite's
-//! single-writer design means writes would do anyway, and no two threads can
-//! be inside the connection at once. What the write-ahead log buys is the
-//! case that is not inside this process: another process — the UI that comes
-//! later — can read the database while the proxy is writing it.
+//! A [`Storage`] holds two connections to the same file, and cloning one
+//! shares them. Writes — inserts, updates, deletes — take the writer.
+//! Reads — a page, one exchange, a search — take the reader. SQLite allows
+//! one writer, so the writer is a mutex; the reader is another, so two
+//! reads still take turns with each other. They do not take turns with the
+//! writer. The write-ahead log, which this store turns on when it opens, is
+//! what makes that true: a search can be reading a body file for the row it
+//! is considering while an insert commits.
 //!
-//! Filesystem work is kept outside the mutex. A body file is written before
+//! That split is the difference between a slow search and a proxy that drops
+//! captured traffic. The storage worker is the writer. If it waited on the
+//! same connection a search was using, its queue would fill and exchanges
+//! would be dropped for as long as the search ran.
+//!
+//! Filesystem work is kept outside the writer. A body file is written before
 //! the connection is taken and read after it is given back, so an exchange
-//! with a large body does not hold the database while its bytes go to disk.
+//! with a large body does not hold the writer while its bytes go to disk.
 //! The one exception is the rename that publishes a body file, which happens
 //! with the transaction open because that is the whole point of it — see
-//! [`bodies`](super::bodies).
+//! [`bodies`](super::bodies). A search still reads a body file while it holds
+//! the *reader*, one file at a time, because that read is how the row is
+//! matched. It does not hold the writer.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -160,7 +169,10 @@ pub struct Storage {
 #[derive(Debug)]
 struct Inner {
     config: StorageConfig,
-    connection: Mutex<Connection>,
+    /// Inserts, updates, and deletes.
+    write: Mutex<Connection>,
+    /// Lists, gets, and searches.
+    read: Mutex<Connection>,
 }
 
 impl Storage {
@@ -180,15 +192,22 @@ impl Storage {
         std::fs::create_dir_all(&config.bodies)
             .map_err(|cause| StorageError::directory(&config.bodies, cause))?;
 
-        let mut connection = Connection::open(&config.database)?;
-        prepare(&connection)?;
-        schema::migrate(&mut connection)?;
-        search::register(&connection, config.bodies.clone())?;
+        let mut write = open_connection(&config.database)?;
+        schema::migrate(&mut write)?;
+        search::register(&write, config.bodies.clone())?;
+
+        // After the migration, so the reader opens a database that is already
+        // at this build's schema. `query_only` makes a write on this
+        // connection fail instead of accidentally taking the writer lock.
+        let read = open_connection(&config.database)?;
+        search::register(&read, config.bodies.clone())?;
+        read.execute_batch("PRAGMA query_only = ON")?;
 
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
-                connection: Mutex::new(connection),
+                write: Mutex::new(write),
+                read: Mutex::new(read),
             }),
         })
     }
@@ -205,7 +224,7 @@ impl Storage {
 
     /// The schema version the database is at.
     pub fn schema_version(&self) -> Result<u32, StorageError> {
-        self.with_connection(|connection| schema::version(connection))
+        self.with_read(|connection| schema::version(connection))
     }
 
     /// Stores one finished exchange.
@@ -234,7 +253,7 @@ impl Storage {
             response_body,
         )?;
 
-        let stored = self.with_connection(|connection| {
+        let stored = self.with_write(|connection| {
             let transaction = connection.transaction()?;
 
             transaction.execute(
@@ -293,7 +312,7 @@ impl Storage {
             response_body,
         )?;
 
-        let stored = self.with_connection(|connection| {
+        let stored = self.with_write(|connection| {
             let transaction = connection.transaction()?;
 
             transaction.execute(
@@ -343,7 +362,7 @@ impl Storage {
     /// error that explains a missing response.
     pub fn get(&self, id: ExchangeId) -> Result<Option<TrafficExchange>, StorageError> {
         let query = format!("SELECT {EXCHANGE_COLUMNS} FROM exchanges WHERE id = ?1");
-        let stored = self.with_connection(|connection| {
+        let stored = self.with_read(|connection| {
             let Some((summary, timing)) = connection
                 .query_row(&query, [id.as_text()], read_exchange_row)
                 .optional()?
@@ -382,7 +401,7 @@ impl Storage {
         );
         values.push(Value::Integer(limit as i64));
 
-        let exchanges = self.with_connection(|connection| {
+        let exchanges = self.with_read(|connection| {
             let mut statement = connection.prepare(&sql)?;
             let rows = statement
                 .query_map(rusqlite::params_from_iter(values), read_exchange_row)?
@@ -417,7 +436,7 @@ impl Storage {
         let (clause, values) = conditions(filter, None, TrafficOrder::default());
         let sql = format!("SELECT COUNT(*) FROM exchanges{clause}");
 
-        self.with_connection(|connection| {
+        self.with_read(|connection| {
             let count: i64 =
                 connection.query_row(&sql, rusqlite::params_from_iter(values), |row| row.get(0))?;
 
@@ -432,7 +451,7 @@ impl Storage {
     /// references — wasted space — and never a row that references a file
     /// which is gone.
     pub fn delete(&self, id: ExchangeId) -> Result<bool, StorageError> {
-        let removed = self.with_connection(|connection| {
+        let removed = self.with_write(|connection| {
             let transaction = connection.transaction()?;
             let mut files = body_files(&transaction, id)?;
             files.extend(super::stream::stream_files(&transaction, id)?);
@@ -454,7 +473,7 @@ impl Storage {
     ///
     /// Says how many exchanges were removed.
     pub fn clear(&self) -> Result<u64, StorageError> {
-        let removed = self.with_connection(|connection| {
+        let removed = self.with_write(|connection| {
             let transaction = connection.transaction()?;
             // The messages go with their exchanges, by the foreign key.
             let rows = transaction.execute("DELETE FROM exchanges", [])?;
@@ -469,22 +488,51 @@ impl Storage {
         Ok(removed)
     }
 
-    /// Runs `work` with the connection.
+    /// Runs `work` on the writer.
     ///
     /// A poisoned lock is recovered from rather than panicked on: something
     /// else already panicked, and a second panic here would take a proxy
     /// connection down over a piece of history-keeping.
-    pub(super) fn with_connection<T>(
+    pub(super) fn with_write<T>(
         &self,
         work: impl FnOnce(&mut Connection) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
-        let mut connection: MutexGuard<'_, Connection> = self
-            .inner
-            .connection
+        self.with_locked(&self.inner.write, work)
+    }
+
+    /// Runs `work` on the reader.
+    ///
+    /// Same poisoning rule as [`with_write`](Self::with_write). A search holds
+    /// this lock while it reads one body file; the writer is a different lock.
+    pub(super) fn with_read<T>(
+        &self,
+        work: impl FnOnce(&mut Connection) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        self.with_locked(&self.inner.read, work)
+    }
+
+    fn with_locked<T>(
+        &self,
+        connection: &Mutex<Connection>,
+        work: impl FnOnce(&mut Connection) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let mut connection: MutexGuard<'_, Connection> = connection
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         work(&mut connection)
+    }
+
+    /// Holds the reader until the guard is dropped.
+    ///
+    /// What a test uses to prove an insert does not wait for a read. Nothing
+    /// else should: a real read is [`with_read`](Self::with_read).
+    #[cfg(test)]
+    fn lease_reader(&self) -> MutexGuard<'_, Connection> {
+        self.inner
+            .read
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Puts an exchange back together, reading any body files it referenced.
@@ -551,6 +599,14 @@ impl Storage {
             timing,
         })
     }
+}
+
+/// Opens `database` and applies the pragmas every connection needs.
+fn open_connection(database: &Path) -> Result<Connection, StorageError> {
+    let connection = Connection::open(database)?;
+    prepare(&connection)?;
+
+    Ok(connection)
 }
 
 /// Sets the connection up before anything is asked of it.
@@ -942,4 +998,51 @@ fn conditions(
     }
 
     (format!(" WHERE {}", clauses.join(" AND ")), values)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+
+    use crate::traffic::{CapturedRequest, ConnectionInfo, Destination, ExchangeId, HttpVersion};
+
+    use super::Storage;
+
+    /// Long enough that a loaded machine still finishes an insert, short
+    /// enough that an insert waiting on the reader fails the test.
+    const INSERT_BOUND: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn a_held_reader_does_not_block_an_insert() {
+        let directory = TempDir::new().expect("a temporary directory");
+        let storage = Storage::open_in(directory.path()).expect("a store");
+        let _reader = storage.lease_reader();
+
+        let (sender, receiver) = mpsc::channel();
+        let writing = storage.clone();
+        thread::spawn(move || {
+            let exchange = exchange();
+            let _ = sender.send(writing.insert(&exchange));
+        });
+
+        let stored = receiver
+            .recv_timeout(INSERT_BOUND)
+            .expect("an insert waited on a reader");
+        stored.expect("the insert is stored");
+    }
+
+    fn exchange() -> crate::traffic::TrafficExchange {
+        let client: SocketAddr = "127.0.0.1:9".parse().expect("an address");
+
+        crate::traffic::TrafficExchange::new(
+            ExchangeId::next(),
+            ConnectionInfo::http(client, Some(Destination::new("example.com", 80))),
+            CapturedRequest::new("GET", "http://example.com/", HttpVersion::Http11),
+        )
+    }
 }

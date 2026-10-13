@@ -207,6 +207,22 @@ struct PauseEditorModelTests {
         #expect(editor.edits()?.request?.body == Data("now it has one".utf8))
     }
 
+    @Test("a query edit is a change to the URL, and the query is not its own edit")
+    func queryEditsTheURL() {
+        let editor = PauseEditorModel(
+            request(body: Data("{}".utf8))
+        )
+        editor.url = "https://api.example.com/orders?since=1"
+
+        #expect(PauseEditorModel.query(in: editor.url) == "since=1")
+        editor.url = PauseEditorModel.url(editor.url, replacingQuery: "since=2")
+
+        #expect(editor.url == "https://api.example.com/orders?since=2")
+        #expect(editor.edits()?.request?.url == "https://api.example.com/orders?since=2")
+        #expect(editor.edits()?.request?.method == nil)
+        #expect(editor.edits()?.request?.body == nil)
+    }
+
     @Test("a body longer than the core will take is refused before it is sent")
     func oversizedBody() {
         let editor = PauseEditorModel(request())

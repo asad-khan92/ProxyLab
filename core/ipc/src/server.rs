@@ -111,7 +111,12 @@ impl IpcServer {
                         ));
                     }
                     Err(error) if is_per_connection(&error) => {
-                        eprintln!("IPC: failed to accept a client: {error}");
+                        proxy_diagnostics::warn(
+                            "ipc",
+                            "accept",
+                            "connection",
+                            &format!("failed to accept a client: {error}"),
+                        );
                     }
                     Err(error) => break Err(error),
                 },

@@ -48,7 +48,7 @@ impl Storage {
     pub fn insert_stream_message(&self, message: &StreamMessage) -> Result<(), StorageError> {
         let staged = bodies::stage_stream(self.config(), message.id, &message.payload)?;
 
-        let stored = self.with_connection(|connection| {
+        let stored = self.with_write(|connection| {
             let transaction = connection.transaction()?;
             transaction.execute(
                 INSERT,
@@ -80,7 +80,7 @@ impl Storage {
         let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
         let fetch = limit + 1;
 
-        let messages = self.with_connection(|connection| {
+        let messages = self.with_read(|connection| {
             let sql = if after.is_some() {
                 format!(
                     "{SELECT_SUMMARY} WHERE exchange_id = ?1 AND sequence > ?2 \
@@ -130,7 +130,7 @@ impl Storage {
         &self,
         id: StreamMessageId,
     ) -> Result<Option<StreamMessage>, StorageError> {
-        let stored = self.with_connection(|connection| {
+        let stored = self.with_read(|connection| {
             match connection
                 .query_row(SELECT_ONE, [id.as_text()], read_message)
                 .optional()?

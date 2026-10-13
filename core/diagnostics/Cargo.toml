@@ -1,0 +1,7 @@
+[package]
+name = "proxy-diagnostics"
+version.workspace = true
+edition.workspace = true
+description = "ProxyLab diagnostics: structured logs, sanitization, and a bounded recent-error buffer."
+
+[dependencies]

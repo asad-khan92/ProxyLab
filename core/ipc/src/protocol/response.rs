@@ -30,6 +30,7 @@ use proxy_storage::{
 use rules::{Rule, RuleId};
 
 use crate::breakpoint::{Breakpoint, BreakpointId, PauseId};
+use crate::diagnostics::DiagnosticsReport;
 use crate::lan::LanStatus;
 use crate::replay::ReplayOutcome;
 use crate::throttle::ThrottleSettings;
@@ -167,6 +168,8 @@ pub enum Outcome {
     ExportHar(HarExported),
     /// A HAR file read in as captured traffic.
     ImportHar(HarImported),
+    /// Where the proxy process stands, and its recent problems.
+    Diagnostics(DiagnosticsReport),
 }
 
 /// Every saved request there is.

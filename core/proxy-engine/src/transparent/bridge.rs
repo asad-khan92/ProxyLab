@@ -70,9 +70,14 @@ pub async fn answer(
     parts: Parts,
 ) -> Response<ProxyBody> {
     if request.method() != Method::CONNECT {
-        eprintln!(
-            "{client} transparent bridge refused {}: not a CONNECT",
-            request.method()
+        proxy_diagnostics::warn(
+            "bridge",
+            "accept",
+            "connection",
+            &format!(
+                "{client} transparent bridge refused {}: not a CONNECT",
+                request.method()
+            ),
         );
 
         return reply::error(StatusCode::METHOD_NOT_ALLOWED, NOT_A_FLOW);
@@ -106,9 +111,14 @@ pub async fn answer(
         }
         Err(error) => {
             recorder.fail(error.traffic_error());
-            eprintln!(
-                "{client} TRANSPARENT {target} -> {} ({error})",
-                error.status()
+            proxy_diagnostics::error(
+                "bridge",
+                "connect",
+                "connection",
+                &format!(
+                    "{client} TRANSPARENT {target} -> {} ({error})",
+                    error.status()
+                ),
             );
 
             reply::error(error.status(), error.reason())
@@ -169,7 +179,12 @@ async fn establish(
                     TrafficErrorKind::ClientDisconnected,
                     "the client did not open the connection it asked for",
                 ));
-                eprintln!("{client} TRANSPARENT {carried} was never opened: {error}");
+                proxy_diagnostics::warn(
+                    "bridge",
+                    "connect",
+                    "connection",
+                    &format!("{client} TRANSPARENT {carried} was never opened: {error}"),
+                );
             }
         }
     });

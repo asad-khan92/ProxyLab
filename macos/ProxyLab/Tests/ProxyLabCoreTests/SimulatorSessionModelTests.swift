@@ -124,6 +124,101 @@ struct SimulatorSessionModelTests {
         #expect(installs[0] == installs[1])
     }
 
+    @Test("transparent capture and a direct Mac proxy still connect a trusted simulator")
+    func transparentCaptureDoesNotRequireTheSystemProxy() async {
+        let simctl = FakeSimctl.listing([("A", "iPhone 17 Pro Max")])
+        let model = model(simctl: simctl, route: FakeProxyRoute(route: .direct))
+        await model.refresh()
+
+        await model.connect(coreIsRunning: true, transparentCaptureListening: true)
+
+        let presented = model.presentation(transparentCaptureListening: true)
+        #expect(presented.connection == .connected(udid: "A"))
+        #expect(presented.trafficPath == .transparentCapture)
+        #expect(presented.note?.isFailure == false)
+        #expect(model.state == .connected(udid: "A"))
+        #expect(model.statusText == "Connected — iPhone 17 Pro Max via transparent capture")
+
+        let note = try? #require(presented.note?.text)
+        #expect(note?.contains("trusts ProxyLab's CA") == true)
+        #expect(note?.contains("transparent capture") == true)
+        #expect(note?.contains("will not reach the proxy") != true)
+        #expect(note?.contains("9091") != true)
+        #expect(simctl.invocations.contains(where: { $0.first == "keychain" }))
+    }
+
+    @Test("an explicit system proxy is the simulator's route even while transparent capture is on")
+    func explicitProxyWinsOverTransparentCapture() async {
+        let model = model(simctl: .listing([("A", "iPhone 17")]))
+        await model.refresh()
+
+        await model.connect(coreIsRunning: true, transparentCaptureListening: true)
+
+        let presented = model.presentation(transparentCaptureListening: true)
+        #expect(presented.connection == .connected(udid: "A"))
+        #expect(presented.trafficPath == .explicitProxy)
+        #expect(presented.statusText == "Connected — iPhone 17 via 127.0.0.1:9090")
+        #expect(presented.note?.text.contains("routes through 127.0.0.1:9090") == true)
+        #expect(presented.note?.text.contains("transparent capture") != true)
+        #expect(presented.note?.text.contains("9091") != true)
+    }
+
+    @Test("with transparent capture off, a direct Mac proxy still says what to set")
+    func explicitProxyStillRequiresTheSystemProxy() async {
+        let model = model(
+            simctl: .listing([("A", "iPhone 17 Pro Max")]),
+            route: FakeProxyRoute(route: .direct)
+        )
+        await model.refresh()
+
+        await model.connect(coreIsRunning: true, transparentCaptureListening: false)
+
+        #expect(model.state == .certificateTrusted(udid: "A"))
+        #expect(model.presentation(transparentCaptureListening: false).trafficPath == nil)
+        let note = try? #require(model.note?.text)
+        #expect(note?.contains("trusts ProxyLab's CA") == true)
+        #expect(note?.contains("will not reach the proxy") == true)
+        #expect(note?.contains("HTTP direct, HTTPS direct") == true)
+        #expect(note?.contains("127.0.0.1:9090") == true)
+        #expect(note?.contains("ProxyLab sets this Mac's HTTP and HTTPS proxy") == true)
+        #expect(note?.contains("Transparent Capture") != true)
+    }
+
+    @Test("CA trust stays a separate fact from whichever route is in force")
+    func certificateTrustIsIndependentOfRouting() async {
+        let missing = FakeSimctl(status: 148, errors: "Invalid device: A")
+        let failed = SimulatorSessionModel(
+            catalog: SimulatorCatalog(runner: FakeSimctl.listing([("A", "iPhone 17")])),
+            trust: SimulatorTrustStore(runner: missing, certificateExists: { _ in true }),
+            routes: FakeProxyRoute(route: .direct),
+            endpoint: Self.proxy,
+            certificatePath: "/ca.pem"
+        )
+        await failed.refresh()
+        await failed.connect(coreIsRunning: true, transparentCaptureListening: true)
+
+        #expect(failed.state == .notConnected)
+        #expect(failed.presentation(transparentCaptureListening: true).trafficPath == nil)
+        #expect(failed.note?.text.contains("Transparent Capture") != true)
+
+        let trusted = model(
+            simctl: .listing([("A", "iPhone 17")]),
+            route: UnreadableProxyRoute()
+        )
+        await trusted.refresh()
+        await trusted.connect(coreIsRunning: true, transparentCaptureListening: true)
+
+        #expect(trusted.state == .connected(udid: "A"))
+        #expect(trusted.note?.isFailure == false)
+        #expect(trusted.note?.text.contains("trusts ProxyLab's CA") == true)
+        // The same trust, with capture no longer listening, is not a route.
+        let explicit = trusted.presentation(transparentCaptureListening: false)
+        #expect(explicit.connection == .certificateTrusted(udid: "A"))
+        #expect(explicit.trafficPath == nil)
+        #expect(explicit.note?.isFailure == true)
+        #expect(explicit.note?.text.contains("could not be read") == true)
+    }
+
     @Test("a route that is not ProxyLab's leaves the CA trusted and says what is missing")
     func routeDoesNotReachProxyLab() async {
         let simctl = FakeSimctl.listing([("A", "iPhone 17")])
@@ -141,7 +236,7 @@ struct SimulatorSessionModelTests {
         #expect(note?.contains("no proxy settings of its own") == true)
         #expect(note?.contains("127.0.0.1:8888") == true)
         #expect(note?.contains("127.0.0.1:9090") == true)
-        #expect(note?.contains("ProxyLab does not change that setting for you") == true)
+        #expect(note?.contains("ProxyLab sets this Mac's HTTP and HTTPS proxy") == true)
     }
 
     @Test("a proxy configuration that cannot be read is reported, not guessed at")
@@ -200,10 +295,8 @@ struct SimulatorSessionModelTests {
         #expect(model.note?.isFailure == false)
 
         let note = try? #require(model.note?.text)
-        #expect(note?.contains("changed no proxy setting") == true)
-        #expect(note?.contains("nothing to restore") == true)
-        // The one thing it does not undo, said rather than left to be found.
         #expect(note?.contains("trust of the ProxyLab CA is left in place") == true)
+        #expect(note?.contains("when capture stops") == true)
     }
 
     @Test("disconnecting and connecting again is allowed as many times as wanted")

@@ -247,7 +247,12 @@ pub async fn forward(
         {
             Ok(response) => response,
             Err(error) => {
-                eprintln!("{client} WebSocket {url} -> 502 ({error})");
+                proxy_diagnostics::error(
+                    "upstream",
+                    "websocket",
+                    "connection",
+                    &format!("{client} WebSocket {url} -> 502 ({error})"),
+                );
                 recorder.fail(TrafficError::new(error.traffic_kind(), error.reason()));
 
                 reply::error(error.status(), error.reason())
@@ -278,7 +283,12 @@ pub async fn forward(
         Err(error) => {
             // The cause names the origin's TLS session or its HTTP framing,
             // which is the developer's business and not the client's.
-            eprintln!("{client} HTTPS request {method} {url} -> 502 ({error})");
+            proxy_diagnostics::error(
+                "upstream",
+                "send",
+                "connection",
+                &format!("{client} HTTPS request {method} {url} -> 502 ({error})"),
+            );
             recorder.fail(TrafficError::new(error.traffic_kind(), error.reason()));
 
             reply::error(error.status(), error.reason())
@@ -336,7 +346,12 @@ async fn forward_mapped(
         {
             Ok(response) => response,
             Err(error) => {
-                eprintln!("{client} WebSocket {url} -> 502 ({error})");
+                proxy_diagnostics::error(
+                    "upstream",
+                    "websocket",
+                    "connection",
+                    &format!("{client} WebSocket {url} -> 502 ({error})"),
+                );
                 recorder.fail(TrafficError::new(error.traffic_kind(), error.reason()));
 
                 reply::error(error.status(), error.reason())
@@ -356,7 +371,12 @@ async fn forward_mapped(
                 .await
         }
         Err(error) => {
-            eprintln!("{client} HTTPS mapped request -> 502 ({error})");
+            proxy_diagnostics::error(
+                "upstream",
+                "send",
+                "connection",
+                &format!("{client} HTTPS mapped request -> 502 ({error})"),
+            );
             recorder.fail(TrafficError::new(error.traffic_kind(), error.reason()));
 
             reply::error(error.status(), error.reason())

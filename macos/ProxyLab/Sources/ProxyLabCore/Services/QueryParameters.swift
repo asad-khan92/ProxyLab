@@ -54,6 +54,16 @@ public struct QueryParameter: Equatable, Sendable, Identifiable {
     ///
     /// What the viewer uses to decide whether showing both is worth the room.
     public var wasEncoded: Bool { name != rawName || value != rawValue }
+
+    /// The parameter as `name=value`, in the decoded form this list shows.
+    ///
+    /// A parameter that had no `=` is the name alone, which is not the same
+    /// thing as a parameter whose value was empty (`name=`).
+    public var parameterText: String {
+        guard let value else { return name }
+
+        return "\(name)=\(value)"
+    }
 }
 
 /// Reading a captured URL's query string.

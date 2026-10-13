@@ -83,6 +83,11 @@ proxy-storage = { path = "../storage" }
 # own crate.
 rules = { path = "../rules" }
 
+# Structured diagnostics for lifecycle and failure lines. The proxy binary
+# installs the recent-error buffer; this crate records into it. Not a new
+# third-party dependency: it is this workspace's own crate.
+proxy-diagnostics = { path = "../diagnostics" }
+
 # HTTP/1.1 framing on both sides of the proxy: reading the client's request and
 # writing its response (`server`), and issuing the origin request and reading
 # its response (`client`). The alternative was parsing HTTP by hand, or using

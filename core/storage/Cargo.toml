@@ -16,6 +16,11 @@ description = "ProxyLab storage: captured request/response persistence, models, 
 # conversions. Not new to the build: serde is already in the dependency tree.
 serde = { version = "1", features = ["derive"] }
 
+# Failure lines from the storage worker. A full queue or a row that could
+# not be written is a diagnostic, and the message is sanitized before it is
+# kept. Not a new third-party dependency: it is this workspace's own crate.
+proxy-diagnostics = { path = "../diagnostics" }
+
 # Raw bytes — request and response bodies, and the rare header value that is
 # not text — have no text form, so the model encodes them as base64. The
 # alternative was serde's own default for `Vec<u8>`, a JSON array of numbers,

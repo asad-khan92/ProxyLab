@@ -118,7 +118,12 @@ fn interfaces() -> Vec<(String, u32, Ipv4Addr)> {
     // the list is freed once, below, with no pointer into it kept: every
     // name and address is copied out.
     if unsafe { libc::getifaddrs(&mut list) } != 0 {
-        eprintln!("Failed to read this machine's network interfaces");
+        proxy_diagnostics::warn(
+            "lan",
+            "discover",
+            "configuration",
+            "failed to read this machine's network interfaces",
+        );
         return Vec::new();
     }
 

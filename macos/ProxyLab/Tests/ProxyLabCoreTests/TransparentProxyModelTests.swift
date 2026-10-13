@@ -6,6 +6,7 @@
 //  captured.
 
 import Foundation
+import SystemExtensions
 import Testing
 import TransparentProxyKit
 
@@ -31,6 +32,52 @@ struct TransparentProxyModelTests {
         #expect(model.canTurnOn)
     }
 
+    @Test("a signed build with nothing installed yet can turn on, and turning on installs")
+    func notInstalledCanTurnOn() async {
+        let control = FakeTransparentProxyControl(extensionState: .notInstalled, tunnel: .off)
+        let model = model(control)
+        await model.refresh()
+
+        #expect(model.canTurnOn)
+        #expect(model.extensionText == "Extension not installed — Turn On installs it")
+        #expect(model.statusText.hasPrefix("Off"))
+
+        await model.turnOn()
+
+        #expect(control.calls == [.snapshot, .snapshot, .activate, .turnOn(9_091), .snapshot])
+        #expect(model.isOn)
+    }
+
+    @Test("an installed extension that is off can turn on without installing again")
+    func installedAndOffCanTurnOn() async {
+        let control = FakeTransparentProxyControl(extensionState: .installed, tunnel: .off)
+        let model = model(control)
+        await model.refresh()
+
+        #expect(model.canTurnOn)
+        #expect(!model.canTurnOff)
+
+        await model.turnOn()
+
+        #expect(control.count(.activate) == 0)
+        #expect(control.count(.turnOn(9_091)) == 1)
+    }
+
+    @Test("capture that is on can turn off")
+    func captureOnCanTurnOff() async {
+        let control = FakeTransparentProxyControl(extensionState: .installed, tunnel: .on)
+        let model = model(control)
+        await model.refresh()
+
+        #expect(model.canTurnOff)
+        #expect(!model.canTurnOn)
+
+        await model.turnOff()
+
+        #expect(control.count(.turnOff) == 1)
+        #expect(!model.isOn)
+    }
+
     @Test("a build that cannot install an extension asks nothing and says why")
     func unavailable() async {
         for readiness in [
@@ -44,8 +91,24 @@ struct TransparentProxyModelTests {
 
             #expect(control.calls.isEmpty, "\(readiness)")
             #expect(!model.canTurnOn)
+            #expect(!model.canRefresh)
+            #expect(model.extensionText == nil)
             #expect(model.readiness.message?.isEmpty == false)
         }
+    }
+
+    @Test("refresh stays available when the extension is simply not installed yet")
+    func refreshWhileNotInstalled() async {
+        let control = FakeTransparentProxyControl(extensionState: .notInstalled, tunnel: .notConfigured)
+        let model = model(control)
+
+        #expect(model.canRefresh)
+
+        await model.refresh()
+
+        #expect(control.calls == [.snapshot])
+        #expect(model.canRefresh)
+        #expect(model.extensionText == "Extension not installed — Turn On installs it")
     }
 
     @Test("turning on installs the extension first, then connects it to the core's bridge port")
@@ -70,6 +133,80 @@ struct TransparentProxyModelTests {
 
         #expect(control.count(.activate) == 0)
         #expect(control.count(.turnOn(9_091)) == 1)
+    }
+
+    @Test("an enabled extension at the same version does not surface a validation failure as a signature error")
+    func installedSameVersionSkipsActivation() async {
+        let control = FakeTransparentProxyControl(extensionState: .installed, tunnel: .off)
+        control.activation = .failure(TransparentProxyFailure.from(
+            systemExtensionError(code: 9, description: "Extension validation failed")
+        ))
+        let model = model(control)
+
+        await model.turnOn()
+
+        #expect(control.count(.activate) == 0)
+        #expect(control.count(.turnOn(9_091)) == 1)
+        #expect(model.isOn)
+        #expect(model.lastError == nil)
+        #expect(model.lastErrorDetail == nil)
+    }
+
+    @Test("a different installed version still goes through activation before the configuration starts")
+    func differentVersionIsReplaced() async {
+        let control = FakeTransparentProxyControl(
+            extensionState: .installed,
+            tunnel: .off,
+            requiresActivation: true
+        )
+        let model = model(control)
+
+        await model.turnOn()
+
+        #expect(control.calls == [.snapshot, .activate, .turnOn(9_091), .snapshot])
+        #expect(model.isOn)
+        #expect(model.lastError == nil)
+    }
+
+    @Test("a rejected signature stays a signature failure, with the system error kept")
+    func signatureFailureKeepsTheSystemError() async {
+        let control = FakeTransparentProxyControl(extensionState: .notInstalled)
+        control.activation = .failure(TransparentProxyFailure.from(systemExtensionError(
+            code: OSSystemExtensionError.Code.codeSignatureInvalid.rawValue,
+            description: "Invalid code signature."
+        )))
+        let model = model(control)
+
+        await model.turnOn()
+
+        #expect(!model.isOn)
+        #expect(model.lastError?.contains("rejected the extension's signature") == true)
+        #expect(model.lastErrorDetail?.contains("OSSystemExtensionErrorDomain 8") == true)
+        #expect(model.lastErrorDetail?.contains("Invalid code signature.") == true)
+    }
+
+    @Test("a validation failure is not described as a rejected signature")
+    func validationFailureIsNotASignatureError() async {
+        let control = FakeTransparentProxyControl(extensionState: .notInstalled)
+        control.activation = .failure(TransparentProxyFailure.from(systemExtensionError(
+            code: OSSystemExtensionError.Code.validationFailed.rawValue,
+            description: "Extension validation failed",
+            underlying: NSError(
+                domain: "NSOSStatusErrorDomain",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "validation status"]
+            )
+        )))
+        let model = model(control)
+
+        await model.turnOn()
+
+        #expect(model.lastError?.contains("could not validate") == true)
+        #expect(model.lastError?.contains("rejected the extension's signature") == false)
+        #expect(model.lastErrorDetail?.contains("OSSystemExtensionErrorDomain 9") == true)
+        #expect(model.lastErrorDetail?.contains("Extension validation failed") == true)
+        #expect(model.lastErrorDetail?.contains("underlying NSOSStatusErrorDomain 4") == true)
+        #expect(model.lastErrorDetail?.contains("validation status") == true)
     }
 
     @Test("waiting for approval says where to give it, and does not claim to be on")
@@ -276,4 +413,107 @@ struct TransparentProxyReadinessTests {
     func bridgePort() {
         #expect(CoreLocations.transparentBridgePort == Int(ProviderConfiguration.defaultBridgePort))
     }
+}
+
+@Suite("System extension errors and replacement")
+struct SystemExtensionActivationTests {
+    @Test("code 8 is a rejected signature and code 9 is validation")
+    func appleCodes() {
+        #expect(OSSystemExtensionError.Code.codeSignatureInvalid.rawValue == 8)
+        #expect(OSSystemExtensionError.Code.validationFailed.rawValue == 9)
+        #expect(OSSystemExtensionError.Code.requestCanceled.rawValue == 11)
+
+        let signature = TransparentProxyFailure.from(systemExtensionError(
+            code: OSSystemExtensionError.Code.codeSignatureInvalid.rawValue,
+            description: "Invalid code signature."
+        ))
+        let validation = TransparentProxyFailure.from(systemExtensionError(
+            code: OSSystemExtensionError.Code.validationFailed.rawValue,
+            description: "Extension validation failed"
+        ))
+
+        #expect(signature.message.contains("rejected the extension's signature"))
+        #expect(signature.domain == (OSSystemExtensionErrorDomain as String))
+        #expect(signature.code == 8)
+        #expect(signature.systemDescription == "Invalid code signature.")
+        #expect(signature.diagnosticRecord?.contains("OSSystemExtensionErrorDomain 8") == true)
+
+        #expect(validation.message.contains("could not validate"))
+        #expect(validation.message.contains("rejected the extension's signature") == false)
+        #expect(validation.code == 9)
+        #expect(validation.systemDescription == "Extension validation failed")
+    }
+
+    @Test("an enabled extension at the same version is used, and a different version is activated")
+    func plan() {
+        let current = ExtensionVersion(shortVersion: "0.1.0", bundleVersion: "1")
+        let rebuilt = ExtensionVersion(shortVersion: "0.1.0", bundleVersion: "2")
+
+        #expect(ExtensionActivation.plan(state: .installed, installed: current, bundled: current) == .useInstalled)
+        #expect(ExtensionActivation.plan(state: .installed, installed: current, bundled: rebuilt) == .activate)
+        #expect(ExtensionActivation.plan(state: .installed, installed: nil, bundled: current) == .useInstalled)
+        #expect(ExtensionActivation.plan(state: .notInstalled, installed: nil, bundled: current) == .activate)
+        #expect(ExtensionActivation.plan(state: .awaitingApproval, installed: current, bundled: current) == .activate)
+        #expect(ExtensionActivation.plan(
+            state: .unknown, installed: nil, bundled: current, configurationSaved: true
+        ) == .useInstalled)
+        #expect(ExtensionActivation.plan(
+            state: .unknown, installed: nil, bundled: current, configurationSaved: false
+        ) == .activate)
+        #expect(ExtensionActivation.plan(
+            state: .notInstalled, installed: nil, bundled: current, configurationSaved: true
+        ) == .activate)
+    }
+
+    @Test("replacement continues only when the version differs")
+    func replacement() {
+        let current = ExtensionVersion(shortVersion: "0.1.0", bundleVersion: "1")
+        let newerBuild = ExtensionVersion(shortVersion: "0.1.0", bundleVersion: "2")
+        let newerShort = ExtensionVersion(shortVersion: "0.2.0", bundleVersion: "1")
+
+        #expect(ExtensionActivation.replacement(existing: current, proposed: current) == .keepInstalled)
+        #expect(ExtensionActivation.replacement(existing: current, proposed: newerBuild) == .replace)
+        #expect(ExtensionActivation.replacement(existing: current, proposed: newerShort) == .replace)
+    }
+
+    @Test("declining a same-version replacement leaves the installed extension usable")
+    func declinedReplacement() {
+        #expect(ExtensionActivation.useInstalledAfterCancellation(
+            domain: OSSystemExtensionErrorDomain as String,
+            code: OSSystemExtensionError.Code.requestCanceled.rawValue
+        ))
+        #expect(!ExtensionActivation.useInstalledAfterCancellation(
+            domain: OSSystemExtensionErrorDomain as String,
+            code: OSSystemExtensionError.Code.validationFailed.rawValue
+        ))
+        #expect(!ExtensionActivation.useInstalledAfterCancellation(
+            domain: OSSystemExtensionErrorDomain as String,
+            code: OSSystemExtensionError.Code.codeSignatureInvalid.rawValue
+        ))
+    }
+
+    @Test("the bundle's two version strings are the ones macOS compares")
+    func bundleVersion() {
+        let version = ExtensionVersion(info: [
+            "CFBundleShortVersionString": "0.1.0",
+            "CFBundleVersion": "1",
+        ])
+
+        #expect(version == ExtensionVersion(shortVersion: "0.1.0", bundleVersion: "1"))
+        #expect(ExtensionVersion(info: ["CFBundleShortVersionString": "0.1.0"]) == nil)
+    }
+}
+
+/// An `OSSystemExtensionErrorDomain` error with the description and underlying
+/// error a failing activation carries.
+private func systemExtensionError(
+    code: Int,
+    description: String,
+    underlying: NSError? = nil
+) -> NSError {
+    var info: [String: Any] = [NSLocalizedDescriptionKey: description]
+    if let underlying {
+        info[NSUnderlyingErrorKey] = underlying
+    }
+    return NSError(domain: OSSystemExtensionErrorDomain as String, code: code, userInfo: info)
 }

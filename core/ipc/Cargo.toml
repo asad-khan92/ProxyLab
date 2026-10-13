@@ -78,6 +78,12 @@ uuid = { version = "1", default-features = false, features = [
 # third-party dependency — it is this workspace's own crate.
 rules = { path = "../rules" }
 
+# Structured diagnostics: sanitizing a status message before it is sent, and
+# the bound on how many recent errors an answer carries. The buffer itself
+# lives in the proxy process. Not a new third-party dependency: it is this
+# workspace's own crate.
+proxy-diagnostics = { path = "../diagnostics" }
+
 [dev-dependencies]
 # The test clients: connecting to the socket, reading and writing lines, and
 # timeouts so a server that never answers fails the suite instead of hanging

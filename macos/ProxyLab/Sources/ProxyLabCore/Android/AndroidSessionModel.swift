@@ -91,6 +91,18 @@ public final class AndroidSessionModel {
     /// Whether a command is running, which is what disables the buttons.
     public private(set) var isWorking = false
 
+    /// Whether discovery has been asked at least once.
+    public private(set) var hasRefreshed = false
+
+    /// The serial whose CA file was copied during this session.
+    ///
+    /// Delivery is a file copy, not a trust check. The emulator does not
+    /// report whether that file was installed.
+    private var deliveredCertificateSerial: String?
+
+    /// Whether `adb` was found when this model was created.
+    public var isAdbAvailable: Bool { runner != nil }
+
     /// What each connected emulator's proxy was before ProxyLab touched it.
     ///
     /// Kept by serial and kept across a disappearance, because the setting it
@@ -150,6 +162,13 @@ public final class AndroidSessionModel {
         !isWorking && (selectedEmulator?.isUsable ?? false)
     }
 
+    /// Whether the connected emulator was given the CA file this session.
+    var certificateDelivered: Bool {
+        guard let serial = state.serial else { return false }
+
+        return deliveredCertificateSerial == serial
+    }
+
     /// What the status line says.
     public var statusText: String {
         switch state {
@@ -171,12 +190,16 @@ public final class AndroidSessionModel {
         guard !isWorking else { return }
         guard let runner else {
             note = failure(.adbNotFound)
+            hasRefreshed = true
 
             return
         }
 
         isWorking = true
-        defer { isWorking = false }
+        defer {
+            isWorking = false
+            hasRefreshed = true
+        }
 
         let running: [AndroidEmulator]
         do {
@@ -198,6 +221,7 @@ public final class AndroidSessionModel {
 
         if let connected = state.serial, !running.contains(where: { $0.serial == connected }) {
             state = .notConnected
+            deliveredCertificateSerial = nil
             note = AndroidNote(
                 text: "\(connected) is no longer running. Its proxy setting is still "
                     + "ProxyLab's — the emulator keeps it across a restart. Start it again and "
@@ -310,6 +334,7 @@ public final class AndroidSessionModel {
         }
 
         savedProxy[serial] = nil
+        deliveredCertificateSerial = nil
         state = .notConnected
         note = AndroidNote(
             text: previous.isProxied
@@ -352,6 +377,7 @@ public final class AndroidSessionModel {
                 certificateExists: certificateExists
             )
             .deliver(certificateAt: certificatePath, to: emulator.serial)
+            deliveredCertificateSerial = emulator.serial
             note = AndroidNote(
                 text: "ProxyLab's CA is on the emulator at \(landed). Install it: "
                     + CertificateInstructions.steps.joined(separator: " ")

@@ -1,14 +1,17 @@
 //  Which flows the provider hands to the core, and which it leaves alone.
 //
-//      new TCP flow
+//      new flow
 //           │
-//           ├─ loopback, or not port 80/443 ───────────▶ not claimed
+//           ├─ UDP, including QUIC on 443 ─────────────▶ not claimed (counted)
+//           ├─ loopback, or TCP not on port 80/443 ────▶ not claimed
 //           ├─ from a process that is ProxyLab's core ─▶ not claimed
 //           ├─ the core was unreachable a moment ago ──▶ not claimed
-//           └─ everything else ────────────────────────▶ bridged to the core
+//           └─ TCP 80 or 443 ──────────────────────────▶ bridged to the core
 //
 //  A flow that is not claimed goes out exactly as it would have with no
-//  provider installed: macOS carries it, and ProxyLab never sees it.
+//  provider installed: macOS carries it, and ProxyLab never sees its bytes.
+//  UDP is not in the rules the provider installs. A QUIC flow therefore never
+//  arrives here and cannot be counted; `decide` still refuses one if it does.
 //
 //  # Loops
 //
@@ -67,6 +70,38 @@ public struct SourceProcess: Hashable, Sendable {
     }
 }
 
+/// TCP or UDP, as the system classified the flow.
+public enum FlowTransport: Equatable, Sendable {
+    case tcp
+    case udp
+}
+
+/// One flow the provider asks macOS to deliver.
+public struct TransparentNetworkRule: Equatable, Sendable {
+    public var transport: FlowTransport
+    public var port: UInt16
+    /// Handed to the core. `false` means the provider counts the flow and
+    /// returns it to macOS.
+    public var claimed: Bool
+
+    public init(transport: FlowTransport, port: UInt16, claimed: Bool) {
+        self.transport = transport
+        self.port = port
+        self.claimed = claimed
+    }
+}
+
+/// An address prefix the provider names in a network rule.
+public struct NetworkPrefix: Equatable, Sendable {
+    public var address: String
+    public var prefix: Int
+
+    public init(address: String, prefix: Int) {
+        self.address = address
+        self.prefix = prefix
+    }
+}
+
 /// What to do with one new flow.
 public enum FlowDecision: Equatable, Sendable {
     /// Hand it to the core.
@@ -78,8 +113,10 @@ public enum FlowDecision: Equatable, Sendable {
         /// Loopback: ProxyLab's own bridge and control traffic, and anything
         /// else that never leaves this Mac.
         case loopback
-        /// Not a port this provider carries.
+        /// TCP, and not a port this provider carries.
         case port
+        /// UDP. Port 443 is QUIC, which this provider does not capture.
+        case udp
         /// The flow is from ProxyLab's core.
         case proxyLab
         /// The core was unreachable a moment ago.
@@ -94,11 +131,18 @@ public struct FlowCandidate: Sendable {
     public let host: String
     public let port: UInt16
     public let source: SourceProcess?
+    public let transport: FlowTransport
 
-    public init(host: String, port: UInt16, source: SourceProcess?) {
+    public init(
+        host: String,
+        port: UInt16,
+        source: SourceProcess?,
+        transport: FlowTransport = .tcp
+    ) {
         self.host = host
         self.port = port
         self.source = source
+        self.transport = transport
     }
 }
 
@@ -107,8 +151,42 @@ public struct FlowCandidate: Sendable {
 /// Called from whichever queue the system delivers a flow on, so everything
 /// it keeps is behind one lock, and every call is short.
 public final class FlowPolicy: Sendable {
-    /// The ports whose flows are offered to the core.
+    /// The ports whose TCP flows are offered to the core.
     public static let interceptedPorts: Set<UInt16> = [80, 443]
+
+    /// What the provider asks macOS to deliver, once per address family.
+    ///
+    /// TCP 80 and 443 are claimed. UDP is absent on purpose. Returning a UDP
+    /// flow from `handleNewUDPFlow` is specified, on current macOS, as
+    /// terminating it — which would break QUIC rather than count it — so
+    /// QUIC is not asked for. `decide` still leaves a UDP flow unclaimed if
+    /// one is offered. Other TCP ports are absent too, and are not counted.
+    public static let deliveredRules: [TransparentNetworkRule] = [
+        TransparentNetworkRule(transport: .tcp, port: 80, claimed: true),
+        TransparentNetworkRule(transport: .tcp, port: 443, claimed: true),
+    ]
+
+    /// IPv4 and IPv6, the whole of each. A family missing from this list is
+    /// a family whose traffic bypasses the provider.
+    public static let includedNetworks: [NetworkPrefix] = [
+        NetworkPrefix(address: "0.0.0.0", prefix: 0),
+        NetworkPrefix(address: "::", prefix: 0),
+    ]
+
+    /// Loopback, excluded for every protocol the provider asks about.
+    public static let excludedLoopback: [NetworkPrefix] = [
+        NetworkPrefix(address: "127.0.0.0", prefix: 8),
+        NetworkPrefix(address: "::1", prefix: 128),
+    ]
+
+    /// What the diagnostics sheet says about the rules above.
+    ///
+    /// No host and no URL: it is the shape of the capture, not the traffic.
+    public static let captureScope =
+        "TCP ports 80 and 443 are claimed on IPv4 and IPv6, except loopback. "
+        + "UDP, including QUIC on port 443, is not delivered, so it bypasses capture and is not counted. "
+        + "Other TCP ports are not delivered either. "
+        + "A TLS failure on a claimed TCP flow is stored as a failed exchange."
 
     /// How long an unreachable core is left alone before it is tried again.
     public static let coreRetryInterval: TimeInterval = 5
@@ -142,10 +220,27 @@ public final class FlowPolicy: Sendable {
             }
 
             switch final {
-            case .bridge: state.counters.bridged += 1
-            case .leave(.proxyLab): state.counters.proxyLab += 1
-            case .leave(.coreUnavailable): state.counters.passedThrough += 1
-            case .leave: break
+            case .bridge:
+                state.counters.bridged += 1
+                if candidate.port == 80 {
+                    state.counters.claimedTcp80 += 1
+                } else {
+                    state.counters.claimedTcp443 += 1
+                }
+            case .leave(.proxyLab):
+                state.counters.proxyLab += 1
+                state.counters.bypassedProxyLab += 1
+            case .leave(.coreUnavailable):
+                state.counters.passedThrough += 1
+                state.counters.bridgeFallback += 1
+            case .leave(.loopback):
+                state.counters.bypassedLoopback += 1
+            case .leave(.port):
+                state.counters.bypassedPort += 1
+            case .leave(.udp):
+                state.counters.bypassedUdp += 1
+            case .leave(.unreadable):
+                state.counters.bypassedUnreadable += 1
             }
 
             return final
@@ -157,6 +252,7 @@ public final class FlowPolicy: Sendable {
         state.withLock { state in
             if let source { state.own.insert(source) }
             state.counters.proxyLab += 1
+            state.counters.bypassedProxyLab += 1
             state.counters.bridged = max(0, state.counters.bridged - 1)
         }
     }
@@ -168,6 +264,7 @@ public final class FlowPolicy: Sendable {
             state.lastBridgeFailure = reason
             state.bridgeHealth = .unreachable
             state.counters.passedThrough += 1
+            state.counters.bridgeFallback += 1
             state.counters.bridged = max(0, state.counters.bridged - 1)
         }
     }
@@ -193,6 +290,14 @@ public final class FlowPolicy: Sendable {
 
     /// The part of the decision that depends on the flow alone.
     static func decision(for candidate: FlowCandidate) -> FlowDecision {
+        // UDP is never bridged. Loopback is named on its own when the
+        // address can be read, so a packet to this Mac is not reported as
+        // QUIC leaving the machine.
+        if candidate.transport == .udp {
+            if !candidate.host.isEmpty, isLoopback(candidate.host) { return .leave(.loopback) }
+            return .leave(.udp)
+        }
+
         guard !candidate.host.isEmpty else { return .leave(.unreadable) }
         if isLoopback(candidate.host) { return .leave(.loopback) }
         guard interceptedPorts.contains(candidate.port) else { return .leave(.port) }

@@ -53,7 +53,12 @@ where
     // has been dropped and the streams they opened are finished.
     tokio::spawn(async move {
         if let Err(error) = connection.await {
-            eprintln!("Upstream HTTP/2 connection error: {error}");
+            proxy_diagnostics::warn(
+                "upstream",
+                "connect",
+                "connection",
+                &format!("upstream HTTP/2 connection error: {error}"),
+            );
         }
     });
 

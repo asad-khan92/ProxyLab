@@ -56,6 +56,54 @@ struct PinnedViewRenderingTests {
         return model
     }
 
+    @Test("the sidebar draws captured domains under the pinned list")
+    func sidebarWithCapturedDomains() async throws {
+        let session = FakeSession()
+        await session.answerLists(with: [
+            .success(
+                TrafficListResult(
+                    exchanges: [
+                        ExchangeSummary(
+                            id: "a",
+                            startedAt: Timestamp(seconds: 1_700_000_000, nanos: 0),
+                            client: "127.0.0.1:1",
+                            scheme: .https,
+                            destination: Destination(host: "api.example.com", port: 443),
+                            method: "GET",
+                            url: "https://api.example.com/v1",
+                            version: .http11,
+                            completed: true
+                        ),
+                        ExchangeSummary(
+                            id: "b",
+                            startedAt: Timestamp(seconds: 1_700_000_000, nanos: 0),
+                            client: "127.0.0.1:1",
+                            scheme: .https,
+                            destination: Destination(host: "cdn.example.com", port: 443),
+                            method: "GET",
+                            url: "https://cdn.example.com/a.js",
+                            version: .http11,
+                            completed: true
+                        ),
+                    ],
+                    nextCursor: nil,
+                    total: 2
+                )
+            )
+        ])
+        let model = TrafficInspectorModel(
+            session: session,
+            socketPath: "/tmp/proxylab-test.sock",
+            reconnect: .manual
+        )
+        await model.start()
+
+        let view = PinnedDomainsView(model: model, pinned: store(["api.example.com"]))
+        let size = try #require(rendered(view.frame(height: 420)))
+        #expect(size.height > 0)
+        #expect(model.knownHosts == ["api.example.com", "cdn.example.com"])
+    }
+
     @Test("the sidebar draws with domains pinned")
     func sidebarWithDomains() async throws {
         let view = await PinnedDomainsView(
@@ -114,13 +162,34 @@ struct PinnedViewRenderingTests {
         let model = await model(host: "api.example.com")
         #expect(model.placeholder == .noHostTraffic("api.example.com"))
 
-        let view = TrafficListView(
+        let view = FocusedTrafficList(
             model: model,
-            pinned: store(["api.example.com"]),
-            selection: .constant(nil)
+            breakpoints: BreakpointsModel(session: FakeBreakpointsSession()),
+            saved: SavedRequestsModel(session: FakeSavedRequestsSession(), traffic: FakeSession()),
+            pinned: store(["api.example.com"])
         )
 
         let size = try #require(rendered(view.frame(height: 320), width: 360))
         #expect(size.height > 0)
+    }
+}
+
+/// The traffic list, with the search focus the filter bar now takes.
+private struct FocusedTrafficList: View {
+    let model: TrafficInspectorModel
+    let breakpoints: BreakpointsModel
+    let saved: SavedRequestsModel
+    let pinned: PinnedDomainsStore
+    @FocusState private var searchFocused: Bool
+
+    var body: some View {
+        TrafficListView(
+            model: model,
+            breakpoints: breakpoints,
+            saved: saved,
+            pinned: pinned,
+            selection: .constant(nil),
+            searchFocused: $searchFocused
+        )
     }
 }

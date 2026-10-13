@@ -1,13 +1,13 @@
 //  One rule in the list.
 //
-//      ⏻  ⛔️ Block analytics                            Block
-//         analytics.example.com · /collect                  10
-//         Answered 403
+//      ⏻  Products fixture          Map Local     10
+//         GET api.example.com/v1/products
+//         → products.json
 //
-//  Three lines, in the order a person reads a rule: what it is called, which
-//  requests it is for, and what happens to them. The switch is first because a
-//  disabled rule is consulted by nothing and everything else about it is then
-//  beside the point.
+//  The switch is first because a disabled rule is consulted by nothing. The
+//  name is what a person scans for, the type and the priority sit on that
+//  same line, and the two lines under it are the match and the action — the
+//  same words the traffic-rule chooser uses. No badge, and no header value.
 
 import SwiftUI
 
@@ -16,91 +16,67 @@ struct RuleRow: View {
     let rule: Rule
     let model: RulesModel
 
+    private var presentation: RuleRowPresentation { RuleRowPresentation(rule: rule) }
+
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: 8) {
             Toggle("", isOn: enabled)
                 .toggleStyle(.switch)
                 .controlSize(.mini)
                 .labelsHidden()
                 .disabled(model.busyIDs.contains(rule.id))
                 .padding(.top, 1)
-                .help(rule.enabled ? "Consulted for every request" : "Not consulted at all")
+                .help(rule.enabled ? "Consulted" : "Not consulted")
                 .accessibilityLabel(rule.enabled ? "Disable \(rule.name)" : "Enable \(rule.name)")
 
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Image(systemName: rule.action.kind.symbol)
-                        .font(.system(size: 10))
-                        .foregroundStyle(tint)
-                        .frame(width: 12)
-                    Text(rule.name)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(presentation.name)
                         .font(.system(size: 12, weight: .medium))
                         .lineLimit(1)
                         .truncationMode(.tail)
+                        .layoutPriority(1)
+
+                    Text(presentation.type)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+
+                    Spacer(minLength: 4)
+
+                    Text("\(presentation.priority)")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .help("Priority \(presentation.priority). Lower is consulted first.")
                 }
 
-                Text(RuleDisplay.matcherSummary(rule.matcher))
+                Text(presentation.match)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
 
-                Text(RuleDisplay.actionSummary(rule.action))
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                if let action = presentation.action {
+                    Text(action)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
-
-            Spacer(minLength: 6)
-
-            VStack(alignment: .trailing, spacing: 4) {
-                ActionTag(kind: rule.action.kind, tint: tint)
-                Text("\(rule.priority)")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .help("Priority \(rule.priority). Lower is consulted first.")
-            }
+            .foregroundStyle(rule.enabled ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
         }
-        .padding(.vertical, 4)
-        // A disabled rule is still shown in full — it is part of the order and
-        // will be again as soon as it is switched on — but it is dimmed, so a
-        // list of rules reads as the rules that are actually being applied.
-        .opacity(rule.enabled ? 1 : 0.5)
+        .padding(.vertical, 2)
+        .accessibilityValue(rule.enabled ? "Enabled" : "Disabled")
     }
 
-    /// The switch, which reads the model and is written through the core.
+    /// The switch reads the rule and is written through the core. Priority is
+    /// not part of that write.
     private var enabled: Binding<Bool> {
         Binding(
             get: { rule.enabled },
             set: { on in Task { await model.setEnabled(on, for: rule) } }
         )
-    }
-
-    /// Colour says what the rule does with a request, and nothing else.
-    private var tint: Color {
-        switch rule.action.kind {
-        case .allow: .green
-        case .block: .red
-        case .mapLocal: .purple
-        case .mapRemote: .blue
-        case .redirect: .indigo
-        case .modifyRequest, .modifyResponse: .orange
-        }
-    }
-}
-
-/// What kind of rule this is, as a word.
-struct ActionTag: View {
-    let kind: RuleActionKind
-    let tint: Color
-
-    var body: some View {
-        Text(kind.title)
-            .font(.system(size: 9, weight: .semibold))
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(tint.opacity(0.16), in: RoundedRectangle(cornerRadius: 4))
-            .foregroundStyle(tint)
     }
 }

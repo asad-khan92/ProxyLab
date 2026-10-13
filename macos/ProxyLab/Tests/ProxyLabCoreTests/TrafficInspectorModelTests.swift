@@ -391,4 +391,34 @@ struct TrafficInspectorModelTests {
         // The core refuses a page larger than a thousand.
         #expect(TrafficInspectorModel.pageSize <= 1_000)
     }
+
+    @Test("a burst of arrivals lands where one event at a time would")
+    func coalescedArrivalsMatchSequentialHandles() async throws {
+        let rows = [
+            Fixtures.summary(id: "c", startedAtSeconds: 300),
+            Fixtures.summary(id: "a", startedAtSeconds: 100),
+            Fixtures.summary(id: "b", startedAtSeconds: 200),
+        ]
+        let burst =
+            rows.map { IPCNotification.event(.trafficAdded($0)) }
+            + [IPCNotification.event(.trafficLost(missed: 2))]
+
+        let prefix = coalescedPrefix(burst)
+        #expect(prefix.traffic.map(\.id) == ["c", "a", "b"])
+        #expect(prefix.streams.isEmpty)
+        #expect(prefix.consumed == 3)
+        #expect(prefix.stoppedAtBarrier)
+
+        let session = FakeSession()
+        let batched = model(session)
+        batched.applyArrivals(prefix.traffic)
+
+        let sequential = model(session)
+        for row in rows {
+            await sequential.handle(.event(.trafficAdded(row)))
+        }
+
+        #expect(batched.exchanges.map(\.id) == sequential.exchanges.map(\.id))
+        #expect(batched.totalExchanges == sequential.totalExchanges)
+    }
 }

@@ -1,140 +1,90 @@
-//  This Mac's own traffic, captured with no proxy setting.
+//  This Mac's detail: the capture lifecycle, and nothing that starts it.
 //
-//      ┌ THIS MAC                    ↻ ┐
-//      │ ● Off — only apps pointed …   │
-//      │   Extension installed         │
-//      │ [ Turn On ]                   │
-//      └───────────────────────────────┘
-//
-//  At the foot of the sidebar, under the iPhone, because it is the same kind
-//  of thing: somewhere traffic comes from, not a host to filter the list by.
-//
-//  Small on purpose, and loud when it matters. Capturing every app's traffic
-//  breaks the apps that pin their certificates, so while it is on the panel
-//  says so in a sentence — and when the core is not there to receive what is
-//  captured, it says that instead, because then nothing is being captured at
-//  all.
+//  The toolbar's Start and Stop are the only capture switch. This view reads
+//  that same lifecycle and says whether the proxy, transparent capture, and
+//  the certificate are ready.
 
 import SwiftUI
 
-/// The Network Extension section.
+/// This Mac, as a detail rather than a second capture control.
 struct TransparentProxySectionView: View {
     let model: TransparentProxyModel
 
-    /// Whether the window's connection to the core is up. Capture can be
-    /// switched without it — the extension is macOS's, not the core's — but
-    /// what happens to the traffic then is different, and is said.
+    /// Whether the window's connection to the core is up.
     let coreConnected: Bool
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            header
-            status
+    /// The app-owned capture lifecycle, when the window has one.
+    ///
+    /// Nil only for a test that draws the extension on its own. The window
+    /// always has one, and the row then says what that lifecycle says.
+    var lifecycle: CaptureLifecycle? = nil
 
-            if let text = model.extensionText {
-                Text(text)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .padding(.leading, 13)
-            }
+    /// LAN, when the detail should mention it. Nil in a test that draws this
+    /// panel on its own.
+    var lan: IPhoneSetupModel? = nil
 
-            if model.readiness == .ready {
-                button
-            }
-
-            footnote
+    private var presented: CaptureSourcePresentation {
+        if let lifecycle {
+            return CaptureSourcePresentation.thisMac(
+                lifecycle: lifecycle,
+                lan: lan,
+                coreConnected: coreConnected
+            )
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(.bar)
-        .overlay(alignment: .top) { Divider() }
+        return Self.withoutLifecycle(model: model, coreConnected: coreConnected)
+    }
+
+    var body: some View {
+        CaptureSourceDetailView(
+            presentation: presented,
+            refreshDisabled: !model.canRefresh,
+            onRefresh: { Task { await model.refresh() } },
+            perform: { _ in }
+        ) {
+            EmptyView()
+        }
         .task { await model.refresh() }
     }
 
-    private var header: some View {
-        HStack(spacing: 4) {
-            Text("THIS MAC")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
-
-            Spacer(minLength: 4)
-
-            Button {
-                Task { await model.refresh() }
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 9))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .disabled(model.isWorking || model.readiness != .ready)
-            .help("Ask macOS again where transparent capture stands")
-            .accessibilityLabel("Refresh transparent capture status")
+    /// The status the row shows. The toolbar's word for Listening and Stopped
+    /// is this same lifecycle; a trust step uses the shorter row wording.
+    static func displayedStatus(lifecycle: CaptureLifecycle?, model: TransparentProxyModel) -> String {
+        if let lifecycle {
+            return CaptureSourcePresentation.thisMac(
+                lifecycle: lifecycle,
+                lan: nil,
+                coreConnected: true
+            ).state.subtitle
         }
+        return model.statusText
     }
 
-    private var status: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(tint)
-                .frame(width: 7, height: 7)
-            Text(model.statusText)
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
+    /// A drawing of the extension with no capture lifecycle beside it.
+    private static func withoutLifecycle(
+        model: TransparentProxyModel,
+        coreConnected: Bool
+    ) -> CaptureSourcePresentation {
+        let awaiting = model.snapshot?.extensionState == .awaitingApproval
+        let input = CaptureSourcePresentation.ThisMacInput(
+            phase: model.isOn ? .listening : .stopped,
+            trustActivity: nil,
+            statusDetail: model.lastError,
+            proxyNotice: nil,
+            coreRunning: coreConnected,
+            transparentOn: model.isOn,
+            transparentAvailable: model.readiness == .ready,
+            awaitingApproval: awaiting,
+            passingThrough: model.isPassingThrough(coreConnected: coreConnected),
+            lanEndpoint: nil,
+            lanWaiting: false
+        )
+        var presentation = CaptureSourcePresentation.thisMac(input)
+        if let notice = model.notice, presentation.message == nil {
+            presentation.message = notice
+        } else if model.readiness != .ready, let reason = model.readiness.message {
+            presentation.message = reason
+            presentation.technicalDetail = nil
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Transparent capture: \(model.statusText)")
-    }
-
-    @ViewBuilder
-    private var button: some View {
-        if model.isOn {
-            Button("Turn Off") {
-                Task { await model.turnOff() }
-            }
-            .controlSize(.small)
-            .disabled(!model.canTurnOff)
-            .help("Stop capturing this Mac's traffic; apps connect directly again")
-        } else {
-            Button("Turn On") {
-                Task { await model.turnOn() }
-            }
-            .controlSize(.small)
-            .disabled(!model.canTurnOn)
-            .help("Capture this Mac's HTTP and HTTPS through ProxyLab, with no proxy setting")
-        }
-    }
-
-    /// One sentence, the most important one there is: why it cannot be used,
-    /// what went wrong, what to do next, or what being on means.
-    @ViewBuilder
-    private var footnote: some View {
-        if let reason = model.readiness.message {
-            sentence(reason, color: .secondary)
-        } else if let error = model.lastError {
-            sentence(error, color: .red)
-        } else if let notice = model.notice {
-            sentence(notice, color: .primary)
-        } else if let warning = model.warning(coreConnected: coreConnected) {
-            sentence(warning, color: .orange)
-        }
-    }
-
-    private func sentence(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.system(size: 10))
-            .foregroundStyle(color)
-            .fixedSize(horizontal: false, vertical: true)
-            .textSelection(.enabled)
-            .accessibilityLabel(text)
-    }
-
-    private var tint: Color {
-        if model.lastError != nil { return .red }
-        guard model.isOn else { return .secondary }
-
-        return model.isPassingThrough(coreConnected: coreConnected) ? .red : .orange
+        return presentation
     }
 }

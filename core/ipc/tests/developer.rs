@@ -706,3 +706,44 @@ async fn an_operation_this_build_does_not_have_is_still_unknown() {
 
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_does_not_wait_for_a_replay_that_has_not_finished() {
+    let (server, replayer) = TestServer::replaying().await;
+    let release = replayer.pause_next();
+    let mut client = server.connect().await;
+
+    let asked = request_with(
+        "1",
+        "replay_request",
+        json!({
+            "method": "POST",
+            "url": "https://example.com/api/users",
+            "headers": [
+                {"name": "Content-Type", "value": {"text": "application/json"}},
+            ],
+            "body": STANDARD.encode(br#"{"name":"Ada"}"#),
+        }),
+    );
+    let held = tokio::spawn(async move {
+        client.send(&asked).await;
+        std::future::pending::<()>().await;
+    });
+
+    tokio::time::timeout(support::TEST_TIMEOUT, async {
+        loop {
+            if !replayer.requests().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the replay was started");
+
+    // `stop` itself gives up after the test timeout. If shutdown waited on
+    // the replay, this fails before `release` is sent.
+    server.stop().await;
+    let _ = release.send(());
+    held.abort();
+}

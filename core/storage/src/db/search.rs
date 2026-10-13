@@ -32,6 +32,17 @@ pub const FLAG_REGEX: i64 = 1;
 /// Bit 1: comparisons are case-sensitive.
 pub const FLAG_CASE_SENSITIVE: i64 = 2;
 
+/// How large a compiled regular expression may be, in bytes.
+///
+/// The `regex` crate already refuses a pattern that will not compile, and it
+/// matches in linear time, so a pattern cannot explode into backtracking.
+/// This is the ceiling on the compiled program itself: a pattern that would
+/// build a huge automaton is refused the same way a pattern that is not a
+/// regular expression is, rather than being allowed to spend the search
+/// building it. One mebibyte is far above a 512-character search box and far
+/// below the crate's own default.
+const REGEX_SIZE_LIMIT: usize = 1024 * 1024;
+
 /// Why a search pattern could not be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InvalidSearch;
@@ -52,12 +63,7 @@ impl Needle {
     /// anything.
     pub fn compile(text: &str, regex: bool, case_sensitive: bool) -> Result<Self, InvalidSearch> {
         let compiled = if regex {
-            Some(
-                RegexBuilder::new(text)
-                    .case_insensitive(!case_sensitive)
-                    .build()
-                    .map_err(|_| InvalidSearch)?,
-            )
+            Some(build_regex(text, case_sensitive)?)
         } else {
             None
         };
@@ -87,8 +93,24 @@ impl Needle {
     /// that ends mid-character can still match the text it did keep. A binary
     /// WebSocket payload is never handed to this.
     pub fn matches_bytes(&self, haystack: &[u8]) -> bool {
-        self.matches_text(&String::from_utf8_lossy(haystack))
+        // Valid UTF-8 is matched in place. The lossy copy exists only for a
+        // capture that was cut off mid-character, which is the case the
+        // capture limit already produces.
+        match std::str::from_utf8(haystack) {
+            Ok(text) => self.matches_text(text),
+            Err(_) => self.matches_text(&String::from_utf8_lossy(haystack)),
+        }
     }
+}
+
+/// Compiles `pattern` with the size ceiling a search is allowed.
+fn build_regex(pattern: &str, case_sensitive: bool) -> Result<Regex, InvalidSearch> {
+    RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|_| InvalidSearch)
 }
 
 /// Whether `haystack` contains `needle`, folding only ASCII case.
@@ -100,21 +122,18 @@ fn contains_ascii_insensitive(haystack: &str, needle: &str) -> bool {
         return true;
     }
 
-    let hay = ascii_lower(haystack);
-    let pin = ascii_lower(needle);
-    hay.contains(&pin)
-}
+    let needle = needle.as_bytes();
+    let haystack = haystack.as_bytes();
+    if needle.len() > haystack.len() {
+        return false;
+    }
 
-fn ascii_lower(text: &str) -> String {
-    text.chars()
-        .map(|character| {
-            if character.is_ascii_uppercase() {
-                character.to_ascii_lowercase()
-            } else {
-                character
-            }
-        })
-        .collect()
+    // Byte windows match `String::contains` on the ASCII-lowered text: a
+    // match is a byte substring, and only `A`–`Z` fold. Nothing is allocated,
+    // which is what matters when the haystack is a captured body.
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 /// The integer the SQL functions take for a filter's search flags.
@@ -131,7 +150,10 @@ pub fn flags(filter: &TrafficFilter) -> i64 {
 
 /// Whether `pattern` is a regular expression this crate can compile.
 pub fn regex_is_valid(pattern: &str) -> bool {
-    Regex::new(pattern).is_ok()
+    // Case-insensitive is the larger program, and it is what a search box
+    // does unless asked otherwise. A pattern that compiles this way is one
+    // the query will accept either way.
+    build_regex(pattern, false).is_ok()
 }
 
 /// Registers the functions a search clause calls.
@@ -169,11 +191,12 @@ pub fn register(connection: &Connection, bodies: PathBuf) -> Result<(), StorageE
             let pattern: String = ctx.get(2)?;
             let flags: i64 = ctx.get(3)?;
             let needle = needle_from(&capture_cache, &pattern, flags)?;
-            let bytes = capture_bytes(&bodies, inline.as_deref(), file.as_deref());
-            match bytes {
-                Some(data) => Ok(i64::from(needle.matches_bytes(&data))),
-                None => Ok(0_i64),
-            }
+            Ok(i64::from(capture_matches(
+                &bodies,
+                &needle,
+                inline.as_deref(),
+                file.as_deref(),
+            )))
         },
     )?;
 
@@ -243,17 +266,30 @@ pub fn clause(filter: &TrafficFilter) -> Option<(String, Vec<Value>)> {
     Some((sql, values))
 }
 
-/// The captured bytes of one message, or nothing if there are none.
-fn capture_bytes(bodies: &Path, inline: Option<&[u8]>, file: Option<&str>) -> Option<Vec<u8>> {
+/// Whether one captured body matches `needle`.
+///
+/// Inline bytes are matched where they already are. A file is read, matched,
+/// and dropped before this returns, so a search never holds more than the
+/// one body it is considering.
+fn capture_matches(
+    bodies: &Path,
+    needle: &Needle,
+    inline: Option<&[u8]>,
+    file: Option<&str>,
+) -> bool {
     if let Some(data) = inline {
-        return Some(data.to_vec());
+        return needle.matches_bytes(data);
     }
-    let name = file?;
+    let Some(name) = file else {
+        return false;
+    };
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-        return None;
+        return false;
     }
-    let path = bodies.join(name);
-    std::fs::read(path).ok()
+    match std::fs::read(bodies.join(name)) {
+        Ok(data) => needle.matches_bytes(&data),
+        Err(_) => false,
+    }
 }
 
 #[derive(Default)]
@@ -340,5 +376,38 @@ mod tests {
 
         assert!(needle.matches_bytes(br#"{"name":"Ada"}"#));
         assert!(!needle.matches_bytes(b"\x00\xff"));
+    }
+
+    #[test]
+    fn a_large_body_is_matched_in_place() {
+        let needle = Needle::compile("needle", false, false).expect("compiles");
+        let mut body = vec![b'x'; 256 * 1024];
+        body.extend_from_slice(b"before NEEDLE after");
+
+        assert!(needle.matches_bytes(&body));
+        assert!(!needle.matches_bytes(&body[..256 * 1024]));
+    }
+
+    #[test]
+    fn a_regular_expression_past_the_size_ceiling_is_refused() {
+        // Optional repetitions grow the compiled program. Past the ceiling
+        // the pattern is refused, the same way one that is not a regular
+        // expression is. A pattern a search box would actually hold still
+        // compiles.
+        let mut pattern = String::new();
+        let mut refused = false;
+        for _ in 0..6 {
+            pattern.push_str(&"a?".repeat(20_000));
+            if Needle::compile(&pattern, true, false).is_err() {
+                refused = true;
+                break;
+            }
+        }
+
+        assert!(
+            refused,
+            "the size ceiling never refused a growing expression"
+        );
+        assert!(regex_is_valid(r"user-\d+"));
     }
 }

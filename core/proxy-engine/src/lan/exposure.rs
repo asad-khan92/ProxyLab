@@ -153,7 +153,12 @@ impl LanExposure {
                 // The address is the developer's own network position and is
                 // already on their screen; what is worth writing down is
                 // that the bind failed and what the operating system said.
-                eprintln!("Failed to listen on the local network: {error}");
+                proxy_diagnostics::error(
+                    "lan",
+                    "bind",
+                    "bind",
+                    &format!("failed to listen on the local network: {error}"),
+                );
 
                 LanRefusal::BindFailed
             })?
@@ -188,7 +193,12 @@ impl LanExposure {
                 .await;
 
             if let Err(error) = outcome {
-                eprintln!("The local network listener stopped: {error}");
+                proxy_diagnostics::error(
+                    "lan",
+                    "shutdown",
+                    "connection",
+                    &format!("the local network listener stopped: {error}"),
+                );
             }
         });
 

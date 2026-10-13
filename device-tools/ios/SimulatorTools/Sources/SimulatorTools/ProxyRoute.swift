@@ -12,9 +12,9 @@
 //
 //  So there is nothing per-simulator to set, nothing to save before setting
 //  it, and nothing to restore afterwards. What there is, is the Mac's own
-//  configuration — and this file reads it and never writes it. ProxyLab does
-//  not change this Mac's proxy settings; it reports what they are and what
-//  they would need to be.
+//  configuration. This file reads it and never writes it. Capture's Start
+//  and Stop are what point the active service at 127.0.0.1:9090 and put the
+//  previous HTTP and HTTPS settings back.
 //
 //      SCDynamicStoreCopyProxies  ──▶  HTTP / HTTPS host and port
 //                                          │

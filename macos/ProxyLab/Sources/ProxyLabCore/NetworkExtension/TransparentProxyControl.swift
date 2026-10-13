@@ -28,8 +28,19 @@ public protocol TransparentProxyControl: AnyObject {
     /// Asks for the extension to be installed, or confirms it is.
     func activate() async throws -> ActivationOutcome
 
+    /// A generation for the Turn On that is about to start the tunnel.
+    ///
+    /// Stop bumps the generation. A Turn On that is still inside a system
+    /// call sees the new value and does not start the tunnel afterwards.
+    func beginTurnOn() -> UInt64
+
+    /// The in-flight Turn On must not start the tunnel.
+    func abandonInFlightWork()
+
     /// Saves the configuration, switched on, and connects it.
-    func turnOn(_ configuration: ProviderConfiguration) async throws
+    ///
+    /// `generation` is the value ``beginTurnOn()`` returned for this attempt.
+    func turnOn(_ configuration: ProviderConfiguration, generation: UInt64) async throws
 
     /// Disconnects the configuration and switches it off.
     func turnOff() async throws

@@ -181,7 +181,12 @@ impl Listener {
                         ));
                     }
                     Err(error) if is_per_connection(&error) => {
-                        eprintln!("Failed to accept a connection: {error}");
+                        proxy_diagnostics::warn(
+                            "listener",
+                            "accept",
+                            "connection",
+                            &format!("failed to accept a connection: {error}"),
+                        );
                     }
                     Err(error) => break Err(error),
                 },

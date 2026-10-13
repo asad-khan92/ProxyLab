@@ -100,6 +100,11 @@ pub async fn serve(
         .await;
 
     if let Err(error) = served {
-        eprintln!("{client} connection error: {error}");
+        proxy_diagnostics::warn(
+            "listener",
+            "connection",
+            "connection",
+            &format!("{client} connection error: {error}"),
+        );
     }
 }

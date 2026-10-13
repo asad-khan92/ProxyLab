@@ -243,10 +243,12 @@ a second copy of what the client first sent is not stored.
 
 ### The rules interface
 
-`Sources/ProxyLabCore/Views/Rules/` is where a rule is written, and it is the
-only thing in the app that knows a rule can be written. What it does is the
-five rule operations and nothing else: list them, create one, change one,
-remove one, and read one back.
+`Sources/ProxyLabCore/Views/Rules/` is where a rule is written. A traffic row can
+open the same editor: its context menu asks for one kind of rule, a sheet lists
+the rules of that kind so one can be turned on or removed, and New Rule opens
+this editor filled in from that exchange. Nothing else in the app writes a rule.
+What the editor does is the five rule operations and nothing else: list them,
+create one, change one, remove one, and read one back.
 
 **Nothing is decided here.** The editor's checks — a name that is not empty, a
 priority that is a number, a path that starts with a slash, a status between

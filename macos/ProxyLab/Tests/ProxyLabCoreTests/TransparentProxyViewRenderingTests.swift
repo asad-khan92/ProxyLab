@@ -20,10 +20,15 @@ struct TransparentProxyViewRenderingTests {
         return renderer.nsImage?.size
     }
 
-    @Test("it draws off, on, on with no core, awaiting approval, and unavailable")
+    @Test("it draws off, not yet installed, on, on with no core, awaiting approval, and unavailable")
     func draws() async {
         let off = TransparentProxyModel(control: FakeTransparentProxyControl(extensionState: .installed, tunnel: .off))
         await off.refresh()
+
+        let notInstalled = TransparentProxyModel(
+            control: FakeTransparentProxyControl(extensionState: .notInstalled, tunnel: .off)
+        )
+        await notInstalled.refresh()
 
         let on = TransparentProxyModel(control: FakeTransparentProxyControl(extensionState: .installed, tunnel: .on))
         await on.refresh()
@@ -35,7 +40,9 @@ struct TransparentProxyViewRenderingTests {
 
         let unavailable = TransparentProxyModel(control: FakeTransparentProxyControl(readiness: .unsigned))
 
-        for (model, core) in [(off, true), (on, true), (on, false), (awaiting, true), (unavailable, false)] {
+        for (model, core) in [
+            (off, true), (notInstalled, true), (on, true), (on, false), (awaiting, true), (unavailable, false),
+        ] {
             let drawn = size(model, coreConnected: core)
             #expect((drawn?.height ?? 0) > 0)
         }

@@ -183,7 +183,34 @@ Load this file when deciding what tests to add/run, test boundaries, integration
   session model — which is where "the core is not running" and "the CA is
   trusted but nothing routes this simulator" become sentences — is tested in
   the macOS package against the same doubles, and the section itself is
-  rendered offscreen with `ImageRenderer` like the other views.
+  rendered offscreen with `ImageRenderer` like the other views. The compact
+  capture-source rows are a presentation of those models and of capture's
+  phase: the words on the row, a LAN address that follows the model, and a
+  short sidebar drawn offscreen. They do not change what Connect does.
+- App-owned capture is tested in the macOS package without a bundled engine
+  and without installing an extension. The process, the readiness check, the
+  system proxy, and macOS are stand-ins. What is asserted is the order:
+  launch, then readiness, then certificate trust, then the system proxy, then
+  transparent capture; the proxy is not configured when the listener is not
+  ready or trust is not; Stop and quit restore it and require the live route
+  to agree before stopping the owned process; a cancelled or unverified
+  restore leaves that process running and refuses quit; a crash restores it
+  and, when the restore cannot be verified, keeps quit blocked; a proxy left
+  behind by a dead session is put back after the listener is ready, and a
+  restore that does not land leaves that listener running; a proxy someone
+  else changed is not overwritten; a port that is already taken is not killed; approval does not hang or submit a second activation;
+  an installed extension starts without one; and the toolbar and This Mac
+  read the same status. Certificate trust is tested against a stand-in
+  keychain. Those tests write certificates only in a temporary directory;
+  they do not install a certificate into this Mac's keychains. A simulator
+  told to trust the same file does not make the Mac trust check succeed.
+  Which service is primary is decided from a service
+  id, and a service named Wi-Fi is not selected for its name. LAN address
+  changes are decided the same way: the old listener is replaced, a missing
+  address is not advertised, and local network access that is off is not
+  turned on by an interface change. One test launches `/bin/sleep` to show
+  Stop signals only the process it started. Packaging checks that
+  `Contents/MacOS/proxy-engine` is in the bundle and executable.
 - Transparent capture is tested in three places, one per process. The
   bridge is tested in `core/proxy-engine/tests/transparent_capture.rs` against
   a real bridge listener, real TLS, and real HTTP/1.1, HTTP/2 and HTTPS

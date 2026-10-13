@@ -462,6 +462,20 @@ public actor IPCClient {
         return applied
     }
 
+    // MARK: - Diagnostics
+
+    /// Where the core stands, and the recent problems it has kept.
+    ///
+    /// Does not read captured traffic. The listeners, the LAN control, and an
+    /// in-memory buffer are the whole of it.
+    public func diagnostics() async throws -> CoreDiagnostics {
+        guard case let .diagnostics(report) = try await send(.diagnostics) else {
+            throw IPCError.malformedMessage
+        }
+
+        return report
+    }
+
     // MARK: - Saved requests
 
     /// Every saved request, in the order they were saved.

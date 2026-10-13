@@ -139,6 +139,11 @@ pub async fn serve(
         .await;
 
     if let Err(error) = served {
-        eprintln!("{client} transparent bridge connection error: {error}");
+        proxy_diagnostics::warn(
+            "bridge",
+            "serve",
+            "connection",
+            &format!("{client} transparent bridge connection error: {error}"),
+        );
     }
 }

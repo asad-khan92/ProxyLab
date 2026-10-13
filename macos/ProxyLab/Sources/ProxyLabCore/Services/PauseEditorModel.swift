@@ -152,6 +152,30 @@ public final class PauseEditorModel {
         }
     }
 
+    // MARK: - The query, as part of the URL
+
+    /// The query `url` carries, without the leading `?`.
+    ///
+    /// Empty when `url` is not one that has a query to edit. Changing it is
+    /// a change to the URL, which is the edit the core already accepts.
+    static func query(in url: String) -> String {
+        guard let components = URLComponents(string: url), components.host != nil else { return "" }
+
+        return components.query ?? ""
+    }
+
+    /// `url` with its query replaced by `query`.
+    ///
+    /// An empty query removes it. A URL that is not absolute is returned
+    /// unchanged, because there is no query component to put back.
+    static func url(_ url: String, replacingQuery query: String) -> String {
+        guard var components = URLComponents(string: url), components.host != nil else { return url }
+
+        components.query = query.isEmpty ? nil : query
+
+        return components.string ?? url
+    }
+
     // MARK: - Headers as text
 
     /// The header section written one header per line.

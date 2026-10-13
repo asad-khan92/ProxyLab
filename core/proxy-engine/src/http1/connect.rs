@@ -160,7 +160,12 @@ async fn prepare<B>(
                     TrafficErrorKind::ClientDisconnected,
                     "the client did not open the connection it asked for",
                 ));
-                eprintln!("{client} CONNECT {intercepted} was never opened: {error}");
+                proxy_diagnostics::warn(
+                    "tls",
+                    "intercept",
+                    "connection",
+                    &format!("{client} CONNECT {intercepted} was never opened: {error}"),
+                );
             }
         }
     });
@@ -215,7 +220,12 @@ pub(crate) fn report(
                 failure => recorder.fail(failure.traffic_error()),
             }
 
-            eprintln!("{client} CONNECT {target} was not intercepted: {error}");
+            proxy_diagnostics::error(
+                "tls",
+                "intercept",
+                "certificate",
+                &format!("{client} CONNECT {target} was not intercepted: {error}"),
+            );
         }
     }
 }

@@ -1,21 +1,26 @@
 //  Working out how a captured body can honestly be shown.
 //
-//      declared text, and it decodes   ──▶  text, in the encoding it decoded as
-//      text that parses as JSON        ──▶  laid out as well as raw
-//      an image                        ──▶  previewed, or described if it will not decode
-//      declared text, nothing decodes  ──▶  said so, and offered as bytes
-//      anything else                   ──▶  said to be binary, with its size
+//      a declared content coding, and it inflates
+//                                          ──▶  those bytes, then
+//      declared text, and it decodes      ──▶  text, in the encoding it decoded as
+//      text that parses as JSON           ──▶  laid out as well as raw
+//      an image                           ──▶  previewed, or described if it will not decode
+//      declared text, nothing decodes     ──▶  said so, and offered as bytes
+//      anything else                      ──▶  said to be binary, with its size
 //
-//  Nothing here writes back to the exchange. Laying JSON out makes a second
-//  string for the view; the stored body stays the bytes the core captured, and
-//  is what a copy or a save produces. A body that was truncated usually will
-//  not parse as JSON, and falls through to text rather than being repaired
-//  into something the server never sent.
+//  Nothing here writes back to the exchange. The capture stays the bytes the
+//  core stored — gzip included, when that is what arrived — and a content
+//  coding is removed only for this reading. Laying JSON out makes a second
+//  string for the view. A body that was truncated usually will not parse as
+//  JSON, and falls through to text rather than being repaired into something
+//  the server never sent. A compressed body that was truncated is left
+//  compressed for the same reason: part of an inflated stream is not the body.
 //
 //  The decision is separate from the view so it can be tested as what it is —
 //  a decision — rather than through a rendered hierarchy, and so it can be
 //  made once per selected exchange, off the main actor, instead of on every
-//  redraw.
+//  redraw. The view does not sniff encodings, and it does not decode the
+//  base64 that was only ever how IPC carried the bytes.
 
 import Foundation
 
@@ -27,11 +32,23 @@ public struct BodyInspection: Equatable, Sendable {
     public let contentType: ContentType?
     /// What can be made of it.
     public let content: Content
+    /// The bytes this reading used.
+    ///
+    /// The capture after a declared Content-Encoding was removed, or the
+    /// capture itself when the message declared none or the coding could not
+    /// be removed. ``capture`` is unchanged either way, and a save writes that.
+    public let presented: Data
 
-    public init(capture: BodyCapture, contentType: ContentType?, content: Content) {
+    public init(
+        capture: BodyCapture,
+        contentType: ContentType?,
+        content: Content,
+        presented: Data? = nil
+    ) {
         self.capture = capture
         self.contentType = contentType
         self.content = content
+        self.presented = presented ?? capture.data
     }
 
     /// What a body turned out to be.
@@ -73,6 +90,12 @@ public struct TextBody: Equatable, Sendable {
     public let text: String
     /// The same text laid out for reading, when there is a layout to apply.
     public let formatted: String?
+    /// Token spans into ``formatted``.
+    ///
+    /// Empty when there is no layout. Offsets are UTF-8 indexes into
+    /// ``formatted``, so a view can color that string without scanning it.
+    /// They are not indexes into the captured bytes or into ``text``.
+    let highlights: [JSONSpan]
     /// A collapsible tree of the same JSON, when `formatted` is set.
     public let tree: JSONNode?
     /// What the text is, as far as anything can say.
@@ -90,8 +113,29 @@ public struct TextBody: Equatable, Sendable {
         encoding: String.Encoding = .utf8,
         shortened: Bool = false
     ) {
+        self.init(
+            text: text,
+            formatted: formatted,
+            highlights: [],
+            tree: tree,
+            language: language,
+            encoding: encoding,
+            shortened: shortened
+        )
+    }
+
+    init(
+        text: String,
+        formatted: String? = nil,
+        highlights: [JSONSpan] = [],
+        tree: JSONNode? = nil,
+        language: Language = .plain,
+        encoding: String.Encoding = .utf8,
+        shortened: Bool = false
+    ) {
         self.text = text
         self.formatted = formatted
+        self.highlights = highlights
         self.tree = tree
         self.language = language
         self.encoding = encoding
@@ -125,17 +169,24 @@ public struct ImageBody: Equatable, Sendable {
 }
 
 extension BodyInspection {
-    /// How to show `capture`, given what `contentType` said it is.
+    /// How to show `capture`, given what `contentType` said it is and, when
+    /// `contentEncoding` names one, after that content coding is removed.
     ///
     /// Not `@MainActor`: this is the expensive half of showing a body, and it
-    /// is meant to be done away from the actor that draws.
-    public static func of(_ capture: BodyCapture, contentType: ContentType? = nil)
-        -> BodyInspection
-    {
-        BodyInspection(
+    /// is meant to be done away from the actor that draws. Removing a content
+    /// coding happens here and nowhere else.
+    public static func of(
+        _ capture: BodyCapture,
+        contentType: ContentType? = nil,
+        contentEncoding: String? = nil
+    ) -> BodyInspection {
+        let reading = reading(of: capture, contentEncoding: contentEncoding)
+
+        return BodyInspection(
             capture: capture,
             contentType: contentType,
-            content: content(of: capture, contentType: contentType)
+            content: content(of: capture, reading: reading, contentType: contentType),
+            presented: reading.bytes
         )
     }
 
@@ -164,28 +215,81 @@ extension BodyInspection {
             exchangeID: exchange.id,
             request: of(
                 exchange.request.body,
-                contentType: ContentType.of(exchange.request.headers)
+                contentType: ContentType.of(exchange.request.headers),
+                contentEncoding: contentEncoding(of: exchange.request.headers)
             ),
             response: exchange.response.map {
-                of($0.body, contentType: ContentType.of($0.headers))
+                of(
+                    $0.body,
+                    contentType: ContentType.of($0.headers),
+                    contentEncoding: contentEncoding(of: $0.headers)
+                )
             }
         )
     }
 
-    private static func content(of capture: BodyCapture, contentType: ContentType?) -> Content {
+    /// The bytes a reading decodes, and whether they are a cut-off capture.
+    private struct Reading {
+        let bytes: Data
+        /// Whether `bytes` are a capture that ended early.
+        ///
+        /// An inflated body is complete or it is not used, so this is false
+        /// once a content coding has been removed.
+        let truncated: Bool
+    }
+
+    /// `capture` after `contentEncoding`, or `capture` itself when that coding
+    /// is absent or cannot be removed.
+    private static func reading(of capture: BodyCapture, contentEncoding: String?) -> Reading {
+        switch ContentCoding.remove(
+            contentEncoding,
+            from: capture.data,
+            truncated: capture.truncated
+        ) {
+        case .notEncoded, .failed:
+            return Reading(bytes: capture.data, truncated: capture.truncated)
+        case let .decoded(bytes):
+            return Reading(bytes: bytes, truncated: false)
+        }
+    }
+
+    /// Every `Content-Encoding` value, in the order the message carried them.
+    ///
+    /// Repeated header fields are one list. The coding applied first is the
+    /// one named first, which is the order ``ContentCoding`` removes in
+    /// reverse.
+    private static func contentEncoding(of headers: Headers) -> String? {
+        let values = headers.entries.compactMap { header -> String? in
+            guard header.name.caseInsensitiveCompare("Content-Encoding") == .orderedSame else {
+                return nil
+            }
+
+            return header.value.text
+        }
+        guard !values.isEmpty else { return nil }
+
+        return values.joined(separator: ", ")
+    }
+
+    private static func content(
+        of capture: BodyCapture,
+        reading: Reading,
+        contentType: ContentType?
+    ) -> Content {
         guard !capture.isEmpty, !capture.data.isEmpty else { return .empty }
+        guard !reading.bytes.isEmpty else { return .empty }
 
         // What the bytes are comes before what they decode to: an image is
         // an image whatever the message called it. SVG is the exception —
         // it is a picture written as text, and the text is the useful way to
         // read it.
         if contentType?.essence != "image/svg+xml",
-            let image = image(of: capture.data, contentType: contentType)
+            let image = image(of: reading.bytes, contentType: contentType)
         {
             return .image(image)
         }
 
-        guard let decoded = text(of: capture, contentType: contentType) else {
+        guard let decoded = text(of: reading, contentType: contentType) else {
             // The sender said it was text and it is not. That is worth saying
             // out loud, because it is usually a bug and not a binary body.
             return contentType?.isTextual == true ? .undecodable : .binary
@@ -196,32 +300,35 @@ extension BodyInspection {
 
     // MARK: - Text
 
-    /// `capture` decoded, laid out if it can be, or `nil` if no encoding read
+    /// `reading` decoded, laid out if it can be, or `nil` if no encoding read
     /// it.
-    private static func text(of capture: BodyCapture, contentType: ContentType?) -> TextBody? {
-        guard let (whole, encoding) = decode(capture, contentType: contentType) else { return nil }
+    private static func text(of reading: Reading, contentType: ContentType?) -> TextBody? {
+        guard let (whole, encoding) = decode(reading, contentType: contentType) else { return nil }
 
         let shortened = whole.count > displayedCharacterLimit
         let shown = shortened ? String(whole.prefix(displayedCharacterLimit)) : whole
         let declared = declaredLanguage(contentType)
 
-        // Laid out from the captured bytes rather than from the decoded
-        // string, so every digit and every escape is the sender's own. Not
-        // attempted for a body shortened for display: what is drawn is no
-        // longer the whole of what was captured, and laying out half a
-        // document would be laying out something nobody sent.
+        // Laid out from the bytes of this reading rather than from the decoded
+        // string, so every digit and every escape is the sender's own. Those
+        // bytes are the capture after a declared Content-Encoding was removed.
+        // Not attempted for a body shortened for display: what is drawn is no
+        // longer the whole of what was read, and laying out half a document
+        // would be laying out something nobody sent.
         //
         // Tried when the sender said JSON, and tried again when the sender
         // said nothing structured but the body opens like JSON — which is
         // most of what arrives as `text/plain` from an API being debugged.
         let worthFormatting =
             !shortened && (declared == .json || (declared == nil && opensLikeJSON(whole)))
-        let formatted = worthFormatting ? prettyPrintedJSON(capture.data) : nil
-        let tree = formatted == nil ? nil : JSONNode.parse(capture.data)
+        let layout = worthFormatting ? prettyPrintedJSON(reading.bytes) : nil
+        let formatted = layout?.text
+        let tree = formatted == nil ? nil : JSONNode.parse(reading.bytes)
 
         return TextBody(
             text: shown,
             formatted: formatted,
+            highlights: layout?.spans ?? [],
             tree: tree,
             language: declared ?? (formatted == nil ? .plain : .json),
             encoding: encoding,
@@ -229,14 +336,14 @@ extension BodyInspection {
         )
     }
 
-    /// `capture` as text, with the encoding that read it.
+    /// `reading` as text, with the encoding that read it.
     ///
     /// The declared character set first, because the sender is the one who
     /// knows; UTF-8 after it, because a great many senders declare nothing and
     /// mean UTF-8. Nothing is tried after that: decoding arbitrary bytes as
     /// Latin-1 always "succeeds", and a page of mojibake presented as the
     /// body is worse than being told the body is not text.
-    private static func decode(_ capture: BodyCapture, contentType: ContentType?)
+    private static func decode(_ reading: Reading, contentType: ContentType?)
         -> (String, String.Encoding)?
     {
         var encodings: [String.Encoding] = []
@@ -244,15 +351,16 @@ extension BodyInspection {
         if !encodings.contains(.utf8) { encodings.append(.utf8) }
 
         for encoding in encodings {
-            if let text = String(data: capture.data, encoding: encoding) {
+            if let text = String(data: reading.bytes, encoding: encoding) {
                 return (text, encoding)
             }
             // A capture cut at the limit can end in the middle of a character,
             // which is not a body that is not text — it is a body that is
             // missing its last few bytes. Only the tail is given up, and only
-            // for a capture that says it was cut.
-            if capture.truncated,
-                let text = decodeTrimmingTail(capture.data, as: encoding)
+            // for a capture that says it was cut. An inflated body is never
+            // cut: a content coding that did not finish was not removed.
+            if reading.truncated,
+                let text = decodeTrimmingTail(reading.bytes, as: encoding)
             {
                 return (text, encoding)
             }
@@ -303,8 +411,9 @@ extension BodyInspection {
     /// Foundation decides whether the bytes are JSON; `JSONPrettyPrinter`
     /// decides how they are laid out. Foundation's own pretty-printer is not
     /// used for the second half because it prints a parsed dictionary, and a
-    /// dictionary has lost the order the fields were sent in.
-    private static func prettyPrintedJSON(_ data: Data) -> String? {
+    /// dictionary has lost the order the fields were sent in. The spans ride
+    /// along with that layout so the view does not scan the text to color it.
+    private static func prettyPrintedJSON(_ data: Data) -> JSONLayout? {
         guard let value = try? JSONSerialization.jsonObject(with: data, options: []) else {
             return nil
         }
@@ -313,7 +422,7 @@ extension BodyInspection {
         // is already there.
         guard value is [Any] || value is [String: Any] else { return nil }
 
-        return JSONPrettyPrinter.format(data)
+        return JSONPrettyPrinter.layout(data)
     }
 
     // MARK: - Images

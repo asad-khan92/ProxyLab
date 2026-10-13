@@ -53,7 +53,7 @@ struct RequestEncodingTests {
     func noParameters() throws {
         // The server refuses a parameter it does not know, and a key whose
         // value is null is still a key.
-        for operation in [IPCOperation.clearTraffic, .subscribe] {
+        for operation in [IPCOperation.clearTraffic, .subscribe, .diagnostics] {
             let json = try encoded(operation)
 
             #expect(Set(json.keys) == ["version", "request_id", "type"])

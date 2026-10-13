@@ -97,23 +97,28 @@ struct TrafficDetailRenderingTests {
         let model = await model(showing: exchange)
         let inspection = try #require(model.inspection)
 
-        let overview = try #require(
-            rendered(
-                VStack { OverviewView(exchange: exchange, inspection: inspection) }
-            )
-        )
+        let reading = InspectorReading.make(exchange: exchange, inspection: inspection)
         let request = try #require(
             rendered(
-                VStack { RequestView(exchange: exchange, inspection: inspection, model: model) }
+                RequestView(
+                    exchange: exchange,
+                    inspection: inspection,
+                    reading: reading,
+                    model: model
+                )
             )
         )
         let response = try #require(
             rendered(
-                VStack { ResponseView(exchange: exchange, inspection: inspection, model: model) }
+                ResponseView(
+                    exchange: exchange,
+                    inspection: inspection,
+                    reading: reading,
+                    model: model
+                )
             )
         )
 
-        #expect(overview.height > 0)
         #expect(request.height > 0)
         #expect(response.height > 0)
     }
@@ -358,7 +363,12 @@ struct TrafficDetailRenderingTests {
 
         let size = try #require(
             rendered(
-                VStack { RequestView(exchange: exchange, inspection: inspection, model: model) }
+                RequestView(
+                    exchange: exchange,
+                    inspection: inspection,
+                    reading: InspectorReading.make(exchange: exchange, inspection: inspection),
+                    model: model
+                )
             )
         )
         #expect(size.height > 0)

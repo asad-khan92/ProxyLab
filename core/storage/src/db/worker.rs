@@ -196,7 +196,7 @@ impl StorageHandle {
                     .reported_a_full_queue
                     .swap(true, Ordering::Relaxed)
                 {
-                    eprintln!("{}", full_queue_report());
+                    proxy_diagnostics::warn("storage", "enqueue", "storage", &full_queue_report());
                 }
 
                 false
@@ -218,7 +218,7 @@ impl StorageHandle {
                     .reported_a_full_queue
                     .swap(true, Ordering::Relaxed)
                 {
-                    eprintln!("{}", full_queue_report());
+                    proxy_diagnostics::warn("storage", "enqueue", "storage", &full_queue_report());
                 }
 
                 false
@@ -284,7 +284,12 @@ fn run(storage: Storage, mut jobs: mpsc::Receiver<Job>, counts: Arc<Counts>) {
                 }
                 Err(error) => {
                     counts.failed.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("{}", failure_report(exchange.id, &error));
+                    proxy_diagnostics::error(
+                        "storage",
+                        "store",
+                        "database",
+                        &failure_report(exchange.id, &error),
+                    );
                 }
             },
             Job::StoreStream(message) => match storage.insert_stream_message(&message) {
@@ -293,7 +298,12 @@ fn run(storage: Storage, mut jobs: mpsc::Receiver<Job>, counts: Arc<Counts>) {
                 }
                 Err(error) => {
                     counts.failed.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("Failed to store stream message {}: {error}", message.id);
+                    proxy_diagnostics::error(
+                        "storage",
+                        "store",
+                        "database",
+                        &format!("failed to store stream message {}: {error}", message.id),
+                    );
                 }
             },
             Job::Flush(reply) => {

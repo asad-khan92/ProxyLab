@@ -119,10 +119,15 @@ pub async fn mapped_local(map: &MapLocal, recorder: &Recorder) -> Response<Proxy
             // The path goes in the log and never in the response: a client
             // being served a fixture has no business learning where on this
             // machine it lives.
-            eprintln!(
-                "Map local failed for {}: {}",
-                map.path().display(),
-                failure.log_reason()
+            proxy_diagnostics::error(
+                "rules",
+                "map_local",
+                "evaluation",
+                &format!(
+                    "map local failed for {}: {}",
+                    map.path().display(),
+                    failure.log_reason()
+                ),
             );
 
             reply::error(StatusCode::INTERNAL_SERVER_ERROR, MAP_LOCAL_REASON)

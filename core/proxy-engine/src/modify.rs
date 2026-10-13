@@ -111,9 +111,14 @@ where
 
             match with_path_and_query(&parts.uri, &path, query.as_deref()) {
                 Some(uri) => parts.uri = uri,
-                None => eprintln!(
-                    "Rule {} left a request's URL alone: the edited one is not a URL",
-                    transformation.rule
+                None => proxy_diagnostics::warn(
+                    "rules",
+                    "transform",
+                    "evaluation",
+                    &format!(
+                        "rule {} left a request's URL alone: the edited one is not a URL",
+                        transformation.rule
+                    ),
                 ),
             }
         }
@@ -181,9 +186,14 @@ where
                 )
                 .await;
             } else {
-                eprintln!(
-                    "Rule {} left a response body alone: a {} to {method} has none",
-                    transformation.rule, parts.status
+                proxy_diagnostics::warn(
+                    "rules",
+                    "transform",
+                    "evaluation",
+                    &format!(
+                        "rule {} left a response body alone: a {} to {method} has none",
+                        transformation.rule, parts.status
+                    ),
                 );
             }
         }
@@ -252,19 +262,29 @@ async fn apply_body<B, T>(
 {
     let original = if edit.reads_body() {
         if is_encoded(headers) {
-            eprintln!(
-                "Rule {} left a {half} body alone: it is compressed, and a JSON edit reads JSON",
-                transformation.rule
+            proxy_diagnostics::warn(
+                "rules",
+                "transform",
+                "evaluation",
+                &format!(
+                    "rule {} left a {half} body alone: it is compressed, and a JSON edit reads JSON",
+                    transformation.rule
+                ),
             );
             return;
         }
 
         body.read_more(BODY_LIMIT, BODY_WINDOW).await;
         if !body.is_complete() {
-            eprintln!(
-                "Rule {} left a {half} body alone: it was longer or slower than an edit waits for, \
-                 and was sent in full",
-                transformation.rule
+            proxy_diagnostics::warn(
+                "rules",
+                "transform",
+                "evaluation",
+                &format!(
+                    "rule {} left a {half} body alone: it was longer or slower than an edit waits for, \
+                     and was sent in full",
+                    transformation.rule
+                ),
             );
             return;
         }
@@ -275,9 +295,14 @@ async fn apply_body<B, T>(
     };
 
     let Some(edited) = edit.apply(&original) else {
-        eprintln!(
-            "Rule {} left a {half} body alone: it is not a JSON object with that field's path",
-            transformation.rule
+        proxy_diagnostics::warn(
+            "rules",
+            "transform",
+            "evaluation",
+            &format!(
+                "rule {} left a {half} body alone: it is not a JSON object with that field's path",
+                transformation.rule
+            ),
         );
         return;
     };

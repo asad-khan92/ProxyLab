@@ -1,11 +1,12 @@
 //! Carrying out what a request asked for.
 //!
 //! This is the whole of the IPC server's access to ProxyLab: a client can
-//! reach the stored traffic through these four operations and through nothing
-//! else. There is no path from a request to a file, to a query of a client's
-//! choosing, or to anything the proxy is doing — an exchange id and a set of
-//! filters are the only things a client gets to decide, and both have already
-//! been checked by the time they reach here.
+//! reach the stored traffic, the rules, and the controls through the
+//! operations below and through nothing else. There is no path from a request
+//! to a file of a client's choosing, or to a query the server did not write.
+//! `diagnostics` is the one question about the process itself, and it reads
+//! the listeners, the LAN control, and an in-memory buffer — never a captured
+//! exchange.
 //!
 //! No SQL lives in this crate. Every operation is a call into
 //! `proxy-storage`, which already owns the schema, the queries, and the body
@@ -35,6 +36,7 @@ use proxy_storage::{
 use rules::{Rule, RuleEngine, RuleSet};
 
 use crate::breakpoint::{BreakpointControl, PauseStream};
+use crate::diagnostics::{self, DiagnosticsControl};
 use crate::lan::LanControl;
 use crate::protocol::{
     BreakpointDeleted, BreakpointDetail, BreakpointList, BreakpointOperation, Cleared,
@@ -61,6 +63,7 @@ pub struct TrafficService {
     lan: Option<Arc<dyn LanControl>>,
     breakpoints: Option<Arc<dyn BreakpointControl>>,
     throttle: Option<Arc<dyn ThrottleControl>>,
+    diagnostics: Option<Arc<dyn DiagnosticsControl>>,
 }
 
 impl TrafficService {
@@ -85,6 +88,7 @@ impl TrafficService {
             lan: None,
             breakpoints: None,
             throttle: None,
+            diagnostics: None,
         }
     }
 
@@ -157,6 +161,16 @@ impl TrafficService {
         self
     }
 
+    /// The same service, also answering `diagnostics` from `diagnostics`.
+    ///
+    /// Without one, the answer still says the core is running and storage is
+    /// open — both of which are true of a server that got this far — and the
+    /// listeners are unknown, because this crate did not bind them.
+    pub fn reporting(mut self, diagnostics: Arc<dyn DiagnosticsControl>) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
     /// Starts receiving the exchanges finished from now on.
     pub fn subscribe(&self) -> EventSubscriber {
         self.publisher.subscribe()
@@ -189,7 +203,12 @@ impl TrafficService {
     ) -> Result<Outcome, ErrorBody> {
         let name = operation.name();
         let Some(breakpoints) = self.breakpoints.clone() else {
-            eprintln!("IPC: the {name} operation was refused: breakpoints are not being served");
+            proxy_diagnostics::warn(
+                "ipc",
+                name,
+                "configuration",
+                "the operation was refused: breakpoints are not being served",
+            );
 
             return Err(ErrorBody::new(
                 ErrorCode::Internal,
@@ -256,7 +275,12 @@ impl TrafficService {
     ) -> Result<Outcome, ErrorBody> {
         let name = operation.name();
         let Some(throttle) = self.throttle.clone() else {
-            eprintln!("IPC: the {name} operation was refused: throttling is not being served");
+            proxy_diagnostics::warn(
+                "ipc",
+                name,
+                "configuration",
+                "the operation was refused: throttling is not being served",
+            );
 
             return Err(ErrorBody::new(
                 ErrorCode::Internal,
@@ -287,7 +311,12 @@ impl TrafficService {
         let Some(engine) = self.engine.clone() else {
             // Not a failure of the request's: this build of the server was
             // started without a rule engine to keep in step.
-            eprintln!("IPC: the {name} operation was refused: rules are not being served");
+            proxy_diagnostics::warn(
+                "ipc",
+                name,
+                "configuration",
+                "the operation was refused: rules are not being served",
+            );
 
             return Err(ErrorBody::new(
                 ErrorCode::Internal,
@@ -298,13 +327,7 @@ impl TrafficService {
 
         let result = tokio::task::spawn_blocking(move || run_rules(&storage, &engine, operation))
             .await
-            .map_err(|_| {
-                eprintln!("IPC: the {name} operation did not finish");
-                ErrorBody::new(
-                    ErrorCode::Internal,
-                    "the server could not finish this operation",
-                )
-            })?;
+            .map_err(|error| abandoned(name, error))?;
 
         result.map_err(|failure| failure.reported(name))
     }
@@ -346,13 +369,7 @@ impl TrafficService {
             }))
         })
         .await
-        .map_err(|_| {
-            eprintln!("IPC: the {name} operation did not finish");
-            ErrorBody::new(
-                ErrorCode::Internal,
-                "the server could not finish this operation",
-            )
-        })?;
+        .map_err(|error| abandoned(name, error))?;
 
         result.map_err(|failure| failure.reported(name))
     }
@@ -369,7 +386,12 @@ impl TrafficService {
         name: &'static str,
     ) -> Result<Outcome, ErrorBody> {
         let Some(replayer) = self.replayer.clone() else {
-            eprintln!("IPC: the {name} operation was refused: replay is not being served");
+            proxy_diagnostics::warn(
+                "ipc",
+                name,
+                "configuration",
+                "the operation was refused: replay is not being served",
+            );
 
             return Err(ErrorBody::new(
                 ErrorCode::Internal,
@@ -393,7 +415,12 @@ impl TrafficService {
     pub async fn execute_lan(&self, operation: LanOperation) -> Result<Outcome, ErrorBody> {
         let name = operation.name();
         let Some(lan) = self.lan.clone() else {
-            eprintln!("IPC: the {name} operation was refused: LAN exposure is not being served");
+            proxy_diagnostics::warn(
+                "ipc",
+                name,
+                "configuration",
+                "the operation was refused: LAN exposure is not being served",
+            );
 
             return Err(ErrorBody::new(
                 ErrorCode::Internal,
@@ -405,24 +432,54 @@ impl TrafficService {
             LanOperation::Status => Ok(Outcome::LanStatus(lan.status().await)),
             LanOperation::Enable(address) => {
                 let status = lan.enable(address).await.map_err(|refusal| {
-                    eprintln!("IPC: the proxy was not put on the local network");
+                    let error = refusal.error();
+                    proxy_diagnostics::warn("lan", "enable", "bind", &error.message);
 
-                    refusal.error()
+                    error
                 })?;
-                println!(
-                    "The proxy is now reachable from the local network on port {}",
-                    status.port
+                proxy_diagnostics::info(
+                    "lan",
+                    "enable",
+                    "lifecycle",
+                    &format!(
+                        "the proxy is now reachable from the local network on port {}",
+                        status.port
+                    ),
                 );
 
                 Ok(Outcome::EnableLan(status))
             }
             LanOperation::Disable => {
                 let status = lan.disable().await;
-                println!("The proxy is no longer reachable from the local network");
+                proxy_diagnostics::info(
+                    "lan",
+                    "disable",
+                    "lifecycle",
+                    "the proxy is no longer reachable from the local network",
+                );
 
                 Ok(Outcome::DisableLan(status))
             }
         }
+    }
+
+    /// Where the process stands, and the recent problems it has kept.
+    ///
+    /// Cheap on purpose. LAN exposure is read from the control the LAN
+    /// operations already use, the listener facts are the ones recorded when
+    /// they were bound, and the recent errors are an in-memory buffer. No
+    /// database is opened and no traffic is read.
+    pub async fn execute_diagnostics(&self) -> Result<Outcome, ErrorBody> {
+        let facts = match &self.diagnostics {
+            Some(diagnostics) => diagnostics.facts(),
+            None => diagnostics::DiagnosticsFacts::serving(env!("CARGO_PKG_VERSION")),
+        };
+        let lan = match &self.lan {
+            Some(lan) => Some(lan.status().await),
+            None => None,
+        };
+
+        Ok(Outcome::Diagnostics(diagnostics::report(facts, lan)))
     }
 
     /// Carries out one saved-request operation.
@@ -441,13 +498,7 @@ impl TrafficService {
 
         let result = tokio::task::spawn_blocking(move || run_saved(&storage, operation))
             .await
-            .map_err(|_| {
-                eprintln!("IPC: the {name} operation did not finish");
-                ErrorBody::new(
-                    ErrorCode::Internal,
-                    "the server could not finish this operation",
-                )
-            })?;
+            .map_err(|error| abandoned(name, error))?;
 
         result.map_err(|failure| failure.reported(name))
     }
@@ -469,13 +520,7 @@ impl TrafficService {
 
         let result = tokio::task::spawn_blocking(move || run_har(&storage, operation))
             .await
-            .map_err(|_| {
-                eprintln!("IPC: the {name} operation did not finish");
-                ErrorBody::new(
-                    ErrorCode::Internal,
-                    "the server could not finish this operation",
-                )
-            })?;
+            .map_err(|error| abandoned(name, error))?;
 
         result.map_err(|failure| failure.reported(name))
     }
@@ -491,13 +536,7 @@ impl TrafficService {
         // propagated.
         let result = tokio::task::spawn_blocking(move || run(&storage, operation))
             .await
-            .map_err(|_| {
-                eprintln!("IPC: the {name} operation did not finish");
-                ErrorBody::new(
-                    ErrorCode::Internal,
-                    "the server could not finish this operation",
-                )
-            })?;
+            .map_err(|error| abandoned(name, error))?;
 
         result.map_err(|failure| failure.reported(name))
     }
@@ -534,10 +573,16 @@ impl Failure {
                         "the search is not a regular expression",
                     );
                 }
-                // The detail — a database path, an operating-system error —
-                // is the proxy's own business, and is worth having in its
-                // log. It names no traffic: see `proxy-storage`.
-                eprintln!("IPC: the {operation} operation failed: {error}");
+                // The operating-system error is worth having in the diagnostic
+                // log. The database path is not: a report is pasted into
+                // issues, and the path is this user's home directory. The
+                // client is told a fixed phrase either way.
+                proxy_diagnostics::error(
+                    "storage",
+                    operation,
+                    "database",
+                    &format!("the {operation} operation failed: {error}"),
+                );
 
                 ErrorBody::new(
                     ErrorCode::StorageUnavailable,
@@ -571,12 +616,15 @@ impl Failure {
                 ErrorBody::new(ErrorCode::InvalidSavedRequest, reason)
             }
             Self::Har(error) => {
-                // The detail names the path the client chose and what the
-                // file system said about it. Worth having in the proxy's own
-                // log; not worth sending, because the message would be the
-                // one thing out of a client's own request that came back.
-                // Nothing in it is out of the file: see `proxy-har`.
-                eprintln!("IPC: the {operation} operation failed: {error}");
+                // What the file system said is worth having. The path the
+                // client chose is not sent back and is not kept in the
+                // diagnostic log: it is this user's own file.
+                proxy_diagnostics::error(
+                    "har",
+                    operation,
+                    "file",
+                    &format!("the {operation} operation failed: {error}"),
+                );
 
                 ErrorBody::new(
                     ErrorCode::HarUnavailable,
@@ -938,15 +986,43 @@ fn import_har(storage: &Storage, path: &str) -> Result<Outcome, Failure> {
                 // rest of the file is still worth having, and the count says
                 // what did not arrive. The error names the database and no
                 // traffic — see `proxy-storage`.
-                eprintln!("IPC: one imported exchange was not stored: {error}");
+                proxy_diagnostics::warn(
+                    "storage",
+                    "import_har",
+                    "database",
+                    &format!("one imported exchange was not stored: {error}"),
+                );
                 skipped += 1;
             }
         }
     }
 
-    println!("Imported {imported} exchanges from a HAR file");
+    proxy_diagnostics::info(
+        "har",
+        "import_har",
+        "lifecycle",
+        &format!("imported {imported} exchanges from a HAR file"),
+    );
 
     Ok(Outcome::ImportHar(HarImported { imported, skipped }))
+}
+
+/// A blocking task that did not return an answer.
+///
+/// The panic payload is not logged. A panic can carry whatever a test or a
+/// bug formatted, and that is not a diagnostic.
+fn abandoned(operation: &'static str, error: tokio::task::JoinError) -> ErrorBody {
+    let message = if error.is_panic() {
+        "the operation panicked"
+    } else {
+        "the operation was cancelled"
+    };
+    proxy_diagnostics::error("ipc", operation, "internal", message);
+
+    ErrorBody::new(
+        ErrorCode::Internal,
+        "the server could not finish this operation",
+    )
 }
 
 /// A page of the traffic list, and how many there are in total.

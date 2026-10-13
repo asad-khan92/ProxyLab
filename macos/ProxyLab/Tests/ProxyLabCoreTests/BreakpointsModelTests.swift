@@ -292,6 +292,64 @@ struct BreakpointsModelTests {
         #expect(model.paused.isEmpty)
     }
 
+    @Test("Continue Without Changes sends nothing, even when the editor was changed")
+    func continueWithoutChanges() async {
+        let session = FakeBreakpointsSession()
+        let model = model(session)
+        model.received(pausedRequest())
+        model.editor?.method = "PUT"
+        model.editor?.bodyText = "{\"id\":2}"
+
+        #expect(await model.continueUnchanged())
+
+        let edits = await session.edits()
+        #expect(edits.count == 1)
+        #expect(edits[0].request == nil)
+        #expect(edits[0].response == nil)
+        #expect(edits[0].websocket == nil)
+        #expect(model.paused.isEmpty)
+    }
+
+    @Test("dropping the exchange on screen cancels it and leaves the others held")
+    func dropLeavesTheOthers() async {
+        let session = FakeBreakpointsSession()
+        let model = model(session)
+        model.received(pausedRequest("pause-1"))
+        model.received(pausedResponse("pause-2"))
+
+        #expect(await model.cancelPause())
+
+        #expect(await session.calls.contains(.cancel("pause-1")))
+        #expect(model.paused.map(\.pauseID) == ["pause-2"])
+        #expect(model.editor?.paused.pauseID == "pause-2")
+        #expect(model.editor?.direction == .response)
+    }
+
+    @Test("held exchanges stay individually selectable, and a later one does not take the screen")
+    func selectsAmongHolds() {
+        let model = model(FakeBreakpointsSession())
+        model.received(pausedRequest("pause-1"))
+        model.editor?.method = "PUT"
+        model.dismissHoldInspector()
+        model.received(pausedResponse("pause-2"))
+
+        #expect(!model.showingHold)
+        #expect(model.paused.map(\.pauseID) == ["pause-1", "pause-2"])
+        #expect(model.current?.pauseID == "pause-1")
+        #expect(model.editor?.method == "PUT")
+
+        model.selectPause("pause-2")
+
+        #expect(model.showingHold)
+        #expect(model.editor?.direction == .response)
+        #expect(model.paused.count == 2)
+
+        model.selectPause("pause-1")
+
+        #expect(model.editor?.method == "PUT")
+        #expect(model.editor?.direction == .request)
+    }
+
     @Test("cancelling sends a cancel and stops showing the exchange")
     func cancels() async {
         let session = FakeBreakpointsSession()
@@ -385,6 +443,71 @@ struct BreakpointsModelTests {
 
         #expect(model.breakpoints.isEmpty)
         #expect(model.lastError == "That breakpoint no longer exists.")
+    }
+
+    @Test("a draft from traffic is configured through the existing create, once per direction")
+    func createsFromTraffic() async {
+        let session = FakeBreakpointsSession()
+        await session.answerList(with: [])
+        let model = model(session)
+        await model.load()
+
+        let matcher = RuleMatcher(
+            host: .exact("staging-api.skonzs.io"),
+            path: .exact("/api/users/notifications/unread-count"),
+            method: .exact("GET")
+        )
+        model.trafficDraft = TrafficBreakpointDraft(
+            host: "staging-api.skonzs.io",
+            path: "/api/users/notifications/unread-count",
+            pathIsPrefix: false,
+            method: "GET",
+            pauseRequest: true,
+            pauseResponse: true
+        )
+        await session.answerCreate(with: .success(breakpoint("bp-new")))
+        await session.answerList(with: [
+            Breakpoint(id: "bp-req", enabled: true, direction: .request, matcher: matcher),
+            Breakpoint(id: "bp-res", enabled: true, direction: .response, matcher: matcher),
+        ])
+
+        #expect(await model.createTrafficDraft())
+        #expect(model.trafficDraft == nil)
+        #expect(model.breakpoints.map(\.id) == ["bp-req", "bp-res"])
+        #expect(model.breakpoints.map(\.direction) == [.request, .response])
+        #expect(model.breakpoints.allSatisfy { $0.matcher == matcher })
+
+        let created = await session.calls.compactMap { call -> NewBreakpoint? in
+            if case let .create(breakpoint) = call { return breakpoint }
+
+            return nil
+        }
+        #expect(created.map(\.direction) == [.request, .response])
+        #expect(created.allSatisfy { $0.enabled && $0.matcher == matcher })
+    }
+
+    @Test("a draft that pauses nothing is not sent")
+    func refusesAnEmptyPause() async {
+        let session = FakeBreakpointsSession()
+        let model = model(session)
+        model.trafficDraft = TrafficBreakpointDraft(
+            host: "api.example.com",
+            path: "/orders",
+            pathIsPrefix: false,
+            method: "GET",
+            pauseRequest: false,
+            pauseResponse: false
+        )
+
+        #expect(await !model.createTrafficDraft())
+        #expect(model.trafficDraft != nil)
+
+        let created = await session.calls.contains { call in
+            if case .create = call { return true }
+
+            return false
+        }
+        #expect(!created)
     }
 
     @Test("creating one asks the core and then reads the list back")

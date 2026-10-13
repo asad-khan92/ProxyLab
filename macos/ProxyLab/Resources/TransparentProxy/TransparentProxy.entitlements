@@ -12,7 +12,8 @@
     sandboxed, and it opens two kinds of outbound connection — to the core's
     bridge on loopback, and straight to a destination when the core is not
     there. It listens on nothing.
-  - application-groups: the group NEMachServiceName sits under.
+  - application-groups: group.<app bundle id>, the explicit App Group. The
+    Mach service name is that group followed by .TransparentProxy.
 
   Nothing here reaches the user's files, keychain, or preferences.
 -->
@@ -32,7 +33,7 @@
     <true/>
     <key>com.apple.security.application-groups</key>
     <array>
-        <string>__TEAM_ID__.__APP_BUNDLE_ID__</string>
+        <string>group.__APP_BUNDLE_ID__</string>
     </array>
 </dict>
 </plist>

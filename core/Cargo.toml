@@ -9,6 +9,7 @@ members = [
     "curl",
     "har",
     "ipc",
+    "diagnostics",
 ]
 
 # Shared metadata inherited by every member crate, so the core has a single

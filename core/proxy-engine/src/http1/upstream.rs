@@ -46,7 +46,12 @@ where
     // dropped, which is what dropping a pooled connection does.
     tokio::spawn(async move {
         if let Err(error) = connection.await {
-            eprintln!("Upstream connection error: {error}");
+            proxy_diagnostics::warn(
+                "upstream",
+                "connect",
+                "connection",
+                &format!("upstream connection error: {error}"),
+            );
         }
     });
 
@@ -79,7 +84,12 @@ where
 
     tokio::spawn(async move {
         if let Err(error) = connection.with_upgrades().await {
-            eprintln!("Upstream connection error: {error}");
+            proxy_diagnostics::warn(
+                "upstream",
+                "connect",
+                "connection",
+                &format!("upstream connection error: {error}"),
+            );
         }
     });
 

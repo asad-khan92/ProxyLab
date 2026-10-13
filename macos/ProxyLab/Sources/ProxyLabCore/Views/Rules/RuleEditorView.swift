@@ -27,10 +27,19 @@
 
 import SwiftUI
 
-/// The rule editor, as a sheet.
+/// Where the editor is being shown.
+enum RuleEditorPlacement {
+    /// The traffic-rule sheet, at a fixed comfortable size.
+    case sheet
+    /// The Rules screen's detail pane, which fills the space it is given.
+    case pane
+}
+
+/// The rule editor, as a sheet or in the rules detail pane.
 struct RuleEditorView: View {
     @Bindable var editor: RuleEditorModel
     let model: RulesModel
+    var placement: RuleEditorPlacement = .sheet
 
     @FocusState private var focus: RuleEditorField?
 
@@ -49,14 +58,16 @@ struct RuleEditorView: View {
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(minHeight: 300)
+            .frame(minHeight: placement == .sheet ? 300 : 0)
 
             Divider()
 
             footer
         }
-        .frame(width: 520)
-        .frame(maxHeight: 640)
+        .modifier(RuleEditorFrame(placement: placement))
+        .onAppear {
+            if focus == nil { focus = .name }
+        }
         .disabled(editor.isGone)
         .overlay { if editor.isGone { goneOverlay } }
     }
@@ -532,6 +543,20 @@ private struct Section<Content: View, Heading: View>: View {
         VStack(alignment: .leading, spacing: 12) {
             heading
             content
+        }
+    }
+}
+
+/// The editor's size: a sheet asks for one, and the detail pane takes what it is given.
+private struct RuleEditorFrame: ViewModifier {
+    let placement: RuleEditorPlacement
+
+    func body(content: Content) -> some View {
+        switch placement {
+        case .sheet:
+            content.frame(width: 520).frame(maxHeight: 640)
+        case .pane:
+            content.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
     }
 }

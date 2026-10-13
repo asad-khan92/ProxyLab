@@ -59,7 +59,7 @@ impl Storage {
     pub fn insert_rule(&self, rule: &Rule) -> Result<(), StorageError> {
         let row = encode(rule)?;
 
-        self.with_connection(|connection| {
+        self.with_write(|connection| {
             connection.execute(INSERT_RULE, rusqlite::params_from_iter(row))?;
 
             Ok(())
@@ -70,7 +70,7 @@ impl Storage {
     pub fn rule(&self, id: RuleId) -> Result<Option<Rule>, StorageError> {
         let sql = format!("SELECT {RULE_COLUMNS} FROM rules WHERE id = ?1");
 
-        let stored = self.with_connection(|connection| {
+        let stored = self.with_read(|connection| {
             let stored = connection
                 .query_row(&sql, [id.as_text()], read_rule)
                 .optional()?;
@@ -89,7 +89,7 @@ impl Storage {
     pub fn list_rules(&self) -> Result<Vec<Rule>, StorageError> {
         let sql = format!("SELECT {RULE_COLUMNS} FROM rules ORDER BY priority ASC, id ASC");
 
-        let stored = self.with_connection(|connection| {
+        let stored = self.with_read(|connection| {
             let mut statement = connection.prepare(&sql)?;
             let rows = statement
                 .query_map([], read_rule)?
@@ -103,7 +103,7 @@ impl Storage {
 
     /// How many rules are stored.
     pub fn count_rules(&self) -> Result<u64, StorageError> {
-        self.with_connection(|connection| {
+        self.with_read(|connection| {
             let count: i64 =
                 connection.query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))?;
 
@@ -123,7 +123,7 @@ impl Storage {
     ) -> Result<Option<Rule>, StorageError> {
         let select = format!("SELECT {RULE_COLUMNS} FROM rules WHERE id = ?1");
 
-        self.with_connection(|connection| {
+        self.with_write(|connection| {
             let transaction = connection.transaction()?;
 
             let stored = transaction
@@ -151,7 +151,7 @@ impl Storage {
 
     /// Removes one rule, and says whether there was one to remove.
     pub fn delete_rule(&self, id: RuleId) -> Result<bool, StorageError> {
-        self.with_connection(|connection| {
+        self.with_write(|connection| {
             let removed = connection.execute("DELETE FROM rules WHERE id = ?1", [id.as_text()])?;
 
             Ok(removed > 0)
@@ -160,7 +160,7 @@ impl Storage {
 
     /// Removes every rule, and says how many there were.
     pub fn clear_rules(&self) -> Result<u64, StorageError> {
-        self.with_connection(|connection| {
+        self.with_write(|connection| {
             let removed = connection.execute("DELETE FROM rules", [])?;
 
             Ok(removed as u64)

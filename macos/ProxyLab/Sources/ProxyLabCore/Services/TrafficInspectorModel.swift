@@ -326,17 +326,27 @@ public final class TrafficInspectorModel {
         return .noMatches
     }
 
-    /// The hosts among the rows that are loaded, in alphabetical order.
+    /// Destination hosts this window has seen, for the sidebar and the host menu.
     ///
-    /// What the host menu offers. Taken from the rows already on screen
-    /// rather than from a list the core keeps: there is no host index to ask,
-    /// and a menu built from what is visible is the one a developer is
-    /// looking at anyway.
-    public var knownHosts: [String] {
-        var hosts = Set(exchanges.compactMap { $0.destination?.host })
-        if let host = filters.host { hosts.insert(host) }
+    /// Kept apart from ``exchanges`` so narrowing the list to one host does not
+    /// hide the others. There is no host index to ask the core for: a host is
+    /// remembered when a page that contains it is loaded, or when a
+    /// `traffic_added` event names it.
+    public private(set) var domains = TrafficDomainCatalog()
 
-        return hosts.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    /// The hosts the host menu and the domain list offer, in alphabetical order.
+    ///
+    /// The catalog, plus the host the list is filtered to when that host has
+    /// not been seen in traffic yet — otherwise the only way out of a filter
+    /// set by hand would be Clear.
+    public var knownHosts: [String] {
+        var hosts = domains.hosts
+        if let host = filters.host, !domains.contains(host) {
+            hosts.append(host)
+            hosts.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        }
+
+        return hosts
     }
 
     // MARK: - Lifecycle
@@ -345,10 +355,14 @@ public final class TrafficInspectorModel {
     public func start() async {
         guard notificationTask == nil else { return }
 
-        notificationTask = Task { [weak self, notifications = session.notifications] in
-            for await notification in notifications {
-                await self?.handle(notification)
-                if Task.isCancelled { return }
+        // Detached so the coalesce window sleeps off the main actor. A burst
+        // of traffic and stream summaries becomes one update; anything else
+        // is still applied as it arrives. `handle` stays immediate, which is
+        // what the tests call.
+        notificationTask = Task.detached { [weak self, notifications = session.notifications] in
+            guard let model = self else { return }
+            await pumpArrivals(notifications, window: arrivalCoalesceWindow) { delivery in
+                await model.apply(delivery)
             }
         }
 
@@ -524,6 +538,7 @@ public final class TrafficInspectorModel {
         guard host != filters.host else { return }
 
         filters.host = host
+        if let host { domains.observe(host) }
         await applyQueryChange()
     }
 
@@ -601,6 +616,7 @@ public final class TrafficInspectorModel {
             guard generation == queryGeneration else { return }
 
             exchanges = page.exchanges
+            domains.observe(page.exchanges)
             totalExchanges = page.total
             nextCursor = page.nextCursor
             hasMoreTraffic = page.nextCursor != nil
@@ -644,6 +660,7 @@ public final class TrafficInspectorModel {
             for summary in page.exchanges {
                 insert(summary)
             }
+            domains.observe(page.exchanges)
 
             totalExchanges = page.total
             nextCursor = page.nextCursor
@@ -900,13 +917,23 @@ public final class TrafficInspectorModel {
     public func deleteSelected() async {
         guard let id = selectedID else { return }
 
+        await deleteExchange(id)
+    }
+
+    /// Removes the exchange `id` names, once the core says it is gone.
+    ///
+    /// The same delete the toolbar uses. The detail pane is cleared only when
+    /// the exchange it is showing is the one that went.
+    func deleteExchange(_ id: String) async {
         do {
             _ = try await session.deleteTraffic(id: id)
 
             exchanges.removeAll { $0.id == id }
             totalExchanges = totalExchanges > 0 ? totalExchanges - 1 : 0
-            selectedID = nil
-            show(.none)
+            if selectedID == id {
+                selectedID = nil
+                show(.none)
+            }
             lastError = nil
         } catch {
             lastError = message(for: error)
@@ -919,6 +946,8 @@ public final class TrafficInspectorModel {
             _ = try await session.clearTraffic()
 
             exchanges = []
+            domains.clear()
+            if let host = filters.host { domains.observe(host) }
             totalExchanges = 0
             nextCursor = nil
             hasMoreTraffic = false
@@ -1020,6 +1049,16 @@ public final class TrafficInspectorModel {
     public func editSelectedAsRequest() async {
         guard let id = selectedID else { return }
 
+        await editAsRequest(id)
+    }
+
+    /// Opens the replay sheet on the exchange `id` names.
+    ///
+    /// The same path Edit & Replay uses: the core writes the command, and the
+    /// import sheet reads it back. Nothing here is selected or sent. A
+    /// WebSocket handshake and an event stream are not offered this; the row
+    /// menu disables them before calling.
+    func editAsRequest(_ id: String) async {
         // Fetched before the sheet opens, so a failure is a message in the
         // status bar rather than an empty sheet with an explanation behind
         // it.
@@ -1181,6 +1220,13 @@ public final class TrafficInspectorModel {
             return nil
         }
 
+        return suggestedSaveName(for: summary)
+    }
+
+    /// What a saved request made from `summary` would be called.
+    ///
+    /// The method and the path, which is what a person would type anyway.
+    func suggestedSaveName(for summary: ExchangeSummary) -> String {
         let path = URL(string: summary.url)?.path
         let tail = path.flatMap { $0.isEmpty ? nil : $0 } ?? summary.url
 
@@ -1188,6 +1234,38 @@ public final class TrafficInspectorModel {
     }
 
     // MARK: - Events
+
+    /// Applies a coalesced batch, or one notification that cannot be batched.
+    private func apply(_ delivery: ArrivalDelivery) async {
+        switch delivery {
+        case let .arrivals(traffic, streams):
+            applyArrivals(traffic)
+            applyStreamArrivals(streams)
+        case let .other(notification):
+            await handle(notification)
+        }
+    }
+
+    /// Inserts a burst of finished exchanges in one turn.
+    ///
+    /// The same `add` a single `traffic_added` uses, so a batch lands where
+    /// those events would have. One search reload is scheduled for the burst:
+    /// each event would have cancelled the last and asked again.
+    func applyArrivals(_ summaries: [ExchangeSummary]) {
+        for summary in summaries {
+            add(summary)
+        }
+        if filters.searchTerm != nil, !summaries.isEmpty {
+            scheduleSearch()
+        }
+    }
+
+    /// Inserts a burst of stream summaries in one turn.
+    func applyStreamArrivals(_ summaries: [StreamMessageSummary]) {
+        for summary in summaries {
+            addedStream(summary)
+        }
+    }
 
     /// Applies one notification from the client.
     ///
@@ -1241,11 +1319,28 @@ public final class TrafficInspectorModel {
         }
     }
 
+    /// The stored exchange, for a rule started from its row.
+    ///
+    /// The one the detail pane already holds when it is this exchange, and
+    /// otherwise a fetch. `nil` when the core does not have it: the draft
+    /// then keeps what the row itself knew.
+    public func capturedExchange(id: String) async -> TrafficExchange? {
+        if case let .loaded(exchange) = detail, exchange.id == id {
+            return exchange
+        }
+
+        return try? await session.traffic(id: id)
+    }
+
     /// Takes in one exchange the proxy has just finished.
     ///
     /// Three questions, in order: is it already here, does the query want it,
     /// and does it belong among the rows that are loaded.
     private func add(_ summary: ExchangeSummary) {
+        // Remembered whether or not the current query shows it, so the domain
+        // list does not collapse to the host the list is filtered to.
+        domains.observe(summary.destination?.host)
+
         // Already listed. An exchange that finished between subscribing and
         // the page arriving is in both, and counting it twice would show a
         // total the core does not have.
@@ -1313,5 +1408,135 @@ public final class TrafficInspectorModel {
     /// What a person is told about `error`.
     private func message(for error: any Error) -> String {
         (error as? IPCError)?.message ?? "Something went wrong talking to the ProxyLab core."
+    }
+}
+
+/// How long a burst of rows is gathered before one list update.
+///
+/// Short enough that a single exchange still shows up as it finishes, long
+/// enough that a busy proxy is one redraw rather than one per event.
+private let arrivalCoalesceWindow: Duration = .milliseconds(32)
+
+/// What the notification pump hands the model.
+private enum ArrivalDelivery: Sendable {
+    case arrivals([ExchangeSummary], [StreamMessageSummary])
+    case other(IPCNotification)
+}
+
+/// The leading traffic and stream events in `notifications`.
+///
+/// A lost event, a breakpoint, or a dropped connection stops the batch: those
+/// change what the list means, and they are applied on their own.
+struct CoalescedArrivals: Equatable, Sendable {
+    var traffic: [ExchangeSummary]
+    var streams: [StreamMessageSummary]
+    var consumed: Int
+    var stoppedAtBarrier: Bool
+}
+
+func coalescedPrefix(_ notifications: [IPCNotification]) -> CoalescedArrivals {
+    var traffic: [ExchangeSummary] = []
+    var streams: [StreamMessageSummary] = []
+
+    for notification in notifications {
+        switch notification {
+        case let .event(.trafficAdded(summary)):
+            traffic.append(summary)
+        case let .event(.streamMessageAdded(summary)):
+            streams.append(summary)
+        default:
+            return CoalescedArrivals(
+                traffic: traffic,
+                streams: streams,
+                consumed: traffic.count + streams.count,
+                stoppedAtBarrier: true
+            )
+        }
+    }
+
+    return CoalescedArrivals(
+        traffic: traffic,
+        streams: streams,
+        consumed: traffic.count + streams.count,
+        stoppedAtBarrier: false
+    )
+}
+
+/// Queues notifications so a burst can be delivered together.
+///
+/// The reader and the pump are different tasks. The continuation is stored
+/// before this actor waits, so a push that arrives as the wait begins is not
+/// missed.
+private actor ArrivalBuffer {
+    private var pending: [IPCNotification] = []
+    private var waiting: CheckedContinuation<Void, Never>?
+    private var finished = false
+
+    func push(_ notification: IPCNotification) {
+        pending.append(notification)
+        waiting?.resume()
+        waiting = nil
+    }
+
+    func finish() {
+        finished = true
+        waiting?.resume()
+        waiting = nil
+    }
+
+    func next(window: Duration) async -> ArrivalDelivery? {
+        if pending.isEmpty {
+            if finished { return nil }
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if !pending.isEmpty || finished {
+                    continuation.resume()
+                } else {
+                    waiting = continuation
+                }
+            }
+            if pending.isEmpty { return nil }
+        }
+
+        if coalescedPrefix(pending).consumed > 0 {
+            do {
+                try await Task.sleep(for: window)
+            } catch {
+                return nil
+            }
+        }
+
+        let prefix = coalescedPrefix(pending)
+        if prefix.consumed > 0 {
+            pending.removeFirst(prefix.consumed)
+            return .arrivals(prefix.traffic, prefix.streams)
+        }
+        guard !pending.isEmpty else { return nil }
+
+        return .other(pending.removeFirst())
+    }
+}
+
+/// Reads `notifications` and delivers bursts of rows, off the main actor.
+private func pumpArrivals(
+    _ notifications: AsyncStream<IPCNotification>,
+    window: Duration,
+    deliver: @escaping @Sendable (ArrivalDelivery) async -> Void
+) async {
+    await withTaskGroup(of: Void.self) { group in
+        let buffer = ArrivalBuffer()
+        group.addTask {
+            for await notification in notifications {
+                if Task.isCancelled { break }
+                await buffer.push(notification)
+            }
+            await buffer.finish()
+        }
+        group.addTask {
+            while let delivery = await buffer.next(window: window) {
+                if Task.isCancelled { return }
+                await deliver(delivery)
+            }
+        }
+        await group.waitForAll()
     }
 }

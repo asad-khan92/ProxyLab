@@ -1,10 +1,8 @@
-//  Everything about the selected rule, and the things that can be done to it.
+//  The selected rule, split into what it matches and what it does.
 //
-//  The whole configuration, not a summary: a rule that is not doing what
-//  someone expected is usually a rule whose matcher says something slightly
-//  different from what they read in the list. So every criterion is shown,
-//  including the ones that are not set — because an unset criterion matches
-//  everything, and that is the part people get wrong.
+//  Editing opens the same editor a new rule uses. This pane does not keep a
+//  second copy of those fields, and it does not save on its own: Edit, then
+//  Save or Cancel in the editor.
 
 import SwiftUI
 
@@ -13,229 +11,137 @@ struct RuleDetailView: View {
     let model: RulesModel
 
     var body: some View {
-        if let rule = model.selected {
+        if let rule = model.selected, model.visibleRules.contains(where: { $0.id == rule.id }) {
             detail(for: rule)
         } else {
             PlaceholderView(
                 symbol: "slider.horizontal.3",
                 title: "No rule selected",
-                detail: "Select a rule to see which requests it is for and what it does "
-                    + "with them."
+                detail: "Select a rule to see what it matches and what it does."
             )
         }
     }
 
     private func detail(for rule: Rule) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+        let content = RuleDetailContent(rule: rule)
+
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
                 header(for: rule)
-                Divider()
-                matching(for: rule)
-                Divider()
-                action(for: rule)
-                Divider()
+                section("Match", note: "An empty criterion matches anything. A path ending in * is a prefix.") {
+                    ForEach(Array(content.match.enumerated()), id: \.offset) { _, line in
+                        DetailLine(label: line.label, value: line.value)
+                    }
+                }
+                section("Action", note: content.actionNote) {
+                    ForEach(Array(content.action.enumerated()), id: \.offset) { _, line in
+                        DetailLine(label: line.label, value: line.value)
+                    }
+                    if content.action.isEmpty, content.changes.isEmpty {
+                        Text("This rule changes nothing.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(Array(content.changes.enumerated()), id: \.offset) { _, change in
+                        Text(change)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                }
                 order(for: rule)
             }
-            .padding(20)
+            .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .toolbar {
-            ToolbarItemGroup(placement: .automatic) {
-                Button {
-                    model.beginEditing(rule)
-                } label: {
-                    Label("Edit Rule", systemImage: "pencil")
-                }
-                .help("Change this rule")
-
-                Button(role: .destructive) {
-                    model.beginDeleting(rule)
-                } label: {
-                    Label("Delete Rule", systemImage: "trash")
-                }
-                .help("Remove this rule")
-            }
-        }
     }
-
-    // MARK: - Sections
 
     private func header(for rule: Rule) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: rule.action.kind.symbol)
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(rule.name)
                     .font(.system(size: 15, weight: .semibold))
+                    .lineLimit(2)
                     .textSelection(.enabled)
+                Spacer(minLength: 8)
+                Text(rule.action.kind.title)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
 
             HStack(spacing: 8) {
-                Label(
-                    rule.enabled ? "Enabled" : "Disabled",
-                    systemImage: rule.enabled ? "checkmark.circle.fill" : "pause.circle"
-                )
-                .font(.system(size: 11))
-                .foregroundStyle(rule.enabled ? Color.green : Color.secondary)
+                Toggle("", isOn: enabled(rule))
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .labelsHidden()
+                    .disabled(model.busyIDs.contains(rule.id))
+                    .accessibilityLabel(rule.enabled ? "Disable \(rule.name)" : "Enable \(rule.name)")
 
-                Text(rule.action.kind.explanation)
+                Text(rule.enabled ? "Enabled" : "Disabled")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 8) {
+                Button("Edit") { model.beginEditing(rule) }
+                Button("Duplicate Rule") { model.beginDuplicating(rule) }
+                Spacer(minLength: 8)
+                Button("Delete Rule", role: .destructive) { model.beginDeleting(rule) }
+            }
+            .controlSize(.small)
+        }
+    }
+
+    private func enabled(_ rule: Rule) -> Binding<Bool> {
+        Binding(
+            get: { rule.enabled },
+            set: { on in Task { await model.setEnabled(on, for: rule) } }
+        )
+    }
+
+    private func section<Content: View>(
+        _ title: String,
+        note: String?,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            if let note {
+                Text(note)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            content()
         }
-    }
-
-    private func matching(for rule: Rule) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SectionHeading(
-                "Matches",
-                help: "Every criterion that is set must match. One that is not set matches "
-                    + "anything."
-            )
-
-            DetailRow(
-                "Host",
-                value: rule.matcher.host?.text,
-                note: "exact, case-insensitive; the port is never compared"
-            )
-            DetailRow(
-                "Path",
-                value: rule.matcher.path?.text,
-                note: rule.matcher.path?.isPrefix == true
-                    ? "every path starting with this; the query is never compared"
-                    : "exact, case-sensitive; the query is never compared"
-            )
-            DetailRow(
-                "Method",
-                value: rule.matcher.method?.text.uppercased(),
-                note: "exact, case-insensitive"
-            )
-
-            if rule.matcher.isAny {
-                Text("This rule matches every request the proxy carries.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.orange)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func action(for rule: Rule) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SectionHeading("Action", help: nil)
-
-            DetailRow("Does", value: rule.action.kind.title, note: nil)
-
-            switch rule.action {
-            case .allow:
-                Text("The request is carried to its origin as the proxy would anyway.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            case let .block(block):
-                DetailRow(
-                    "Answers",
-                    value: "\(block.status)",
-                    note: "with one fixed sentence the core writes; the origin is never "
-                        + "contacted"
-                )
-            case let .mapLocal(map):
-                DetailRow(
-                    "File",
-                    value: RuleDisplay.abbreviated(map.path),
-                    note: "read by the core each time the rule answers; nothing from the "
-                        + "request is joined to this path"
-                )
-                DetailRow(
-                    "Content type",
-                    value: map.contentType,
-                    note: "worked out from the file's extension when not set"
-                )
-                DetailRow("Answers", value: "\(map.status)", note: nil)
-            case let .mapRemote(target):
-                DetailRow("Destination", value: target.url, note: nil)
-                DetailRow(
-                    "Path",
-                    value: target.path,
-                    note: "the request's own path is kept when this is not set"
-                )
-                DetailRow(
-                    "Query",
-                    value: target.query,
-                    note: "the request's own query is kept when this is not set"
-                )
-                Text(
-                    "The method, body, and headers are the request's own. Only Host is "
-                        + "rewritten, to name where the request is actually going."
-                )
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            case let .redirect(redirect):
-                DetailRow(
-                    "Location",
-                    value: redirect.target.url,
-                    note: "exactly as written; nothing from the request is carried over"
-                )
-                DetailRow(
-                    "Answers",
-                    value: "\(redirect.status)",
-                    note: "the origin is never contacted"
-                )
-            case let .modifyRequest(modify):
-                changeList(RuleDisplay.changes(of: modify))
-                note(
-                    "Applied only to a request that is sent to an origin, after any request "
-                        + "breakpoint. The traffic list records the request as it was sent."
-                )
-            case let .modifyResponse(modify):
-                changeList(RuleDisplay.changes(of: modify))
-                note(
-                    "Applied to the origin's response before any response breakpoint shows "
-                        + "it. The traffic list records what the client was given."
-                )
-            }
-        }
-    }
-
-    /// What a Modify rule changes, one line each.
-    private func changeList(_ changes: [String]) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            ForEach(Array(changes.enumerated()), id: \.offset) { _, change in
-                Label(change, systemImage: "pencil")
-                    .font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled)
-            }
-        }
-    }
-
-    private func note(_ text: String) -> some View {
-        Text(text)
-            .font(.system(size: 11))
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
     }
 
     private func order(for rule: Rule) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SectionHeading(
-                "Order",
-                help: "Rules are consulted by priority, lowest first. The first enabled rule "
-                    + "that matches decides; nothing after it is consulted. A Modify rule "
-                    + "decides nothing, so the rules after it still are."
-            )
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Order")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
 
-            HStack(spacing: 10) {
-                DetailRow("Priority", value: "\(rule.priority)", note: nil)
+            HStack(spacing: 8) {
+                if let place = model.rules.firstIndex(where: { $0.id == rule.id }) {
+                    Text("\(place + 1) of \(model.rules.count)")
+                        .font(.system(size: 11, design: .monospaced))
+                }
+                Text("Priority \(rule.priority)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .help("Lower is consulted first. Equal priorities are ordered by id, oldest first.")
 
-                Spacer()
+                Spacer(minLength: 8)
 
                 Button {
                     Task { await model.moveUp(rule) }
                 } label: {
                     Label("Move Up", systemImage: "chevron.up")
                 }
+                .labelStyle(.iconOnly)
                 .disabled(!model.canMoveUp(rule))
                 .help("Consult this rule earlier")
 
@@ -244,75 +150,37 @@ struct RuleDetailView: View {
                 } label: {
                     Label("Move Down", systemImage: "chevron.down")
                 }
+                .labelStyle(.iconOnly)
                 .disabled(!model.canMoveDown(rule))
                 .help("Consult this rule later")
             }
-            .labelStyle(.iconOnly)
             .controlSize(.small)
-        }
-    }
-}
 
-/// A heading above one group of a rule's configuration.
-private struct SectionHeading: View {
-    let title: String
-    let help: String?
-
-    init(_ title: String, help: String?) {
-        self.title = title
-        self.help = help
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title.uppercased())
-                .font(.system(size: 10, weight: .semibold))
+            Text("Modify rules apply until the first deciding rule. Nothing below that decision is consulted.")
+                .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
-            if let help {
-                Text(help)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
 
-/// One labelled value, with what the core does with it underneath.
-///
-/// A value that is not set says "Any" rather than being blank, because a
-/// criterion that is not set matches everything and a blank line reads as a
-/// criterion that matches nothing.
-private struct DetailRow: View {
+/// One labelled value in the detail pane.
+private struct DetailLine: View {
     let label: String
-    let value: String?
-    let note: String?
-
-    init(_ label: String, value: String?, note: String?) {
-        self.label = label
-        self.value = value
-        self.note = note
-    }
+    let value: String
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text(label)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-                .frame(width: 92, alignment: .leading)
+                .frame(width: 88, alignment: .leading)
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(value ?? RuleDisplay.anything)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(value == nil ? .tertiary : .primary)
-                    .textSelection(.enabled)
-                if let note {
-                    Text(note)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
+            Text(value)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(value == RuleDisplay.anything ? .tertiary : .primary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }

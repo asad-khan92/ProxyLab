@@ -154,7 +154,13 @@ impl Replayer {
                 // The cause may be more specific than what is captured, and
                 // names a socket or a TLS detail rather than anything the
                 // request carried.
-                eprintln!("Replay failed: {failure}");
+                proxy_diagnostics::error_with(
+                    "replay",
+                    "send",
+                    "replay",
+                    &format!("replay failed: {failure}"),
+                    proxy_diagnostics::Detail::none().with_exchange(&id.to_string()),
+                );
                 recorder.fail(error.clone());
 
                 ReplayOutcome::failed(id, error)

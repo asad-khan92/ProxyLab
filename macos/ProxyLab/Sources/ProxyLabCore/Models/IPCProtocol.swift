@@ -138,6 +138,8 @@ public enum IPCOperation: Sendable, Equatable {
     case exportHar(HarExportRequest)
     /// Read the HAR file at this path, and keep what it describes.
     case importHar(path: String)
+    /// Where the core stands, and the recent problems it has kept.
+    case diagnostics
 
     /// What this operation is called on the wire.
     public var name: String {
@@ -177,6 +179,7 @@ public enum IPCOperation: Sendable, Equatable {
         case .deleteSavedRequest: "delete_saved_request"
         case .exportHar: "export_har"
         case .importHar: "import_har"
+        case .diagnostics: "diagnostics"
         }
     }
 }
@@ -453,7 +456,7 @@ public struct IPCRequest: Encodable, Sendable, Equatable {
         case let .getStreamMessage(streamMessageID):
             try container.encode(streamMessageID, forKey: .streamMessageID)
         case .clearTraffic, .subscribe, .listRules, .lanStatus, .disableLan, .listBreakpoints,
-            .watchBreakpoints, .throttleStatus, .listSavedRequests:
+            .watchBreakpoints, .throttleStatus, .listSavedRequests, .diagnostics:
             // None of them takes a parameter, and the server refuses one that
             // is sent any — including a key whose value is null.
             break
@@ -668,6 +671,8 @@ public enum IPCResult: Sendable, Equatable {
     case exportHar(HarExportResult)
     /// A HAR file read in as captured traffic.
     case importHar(HarImportResult)
+    /// Where the core stands, and the recent problems it has kept.
+    case diagnostics(CoreDiagnostics)
 }
 
 /// A page of the traffic list.
@@ -969,6 +974,8 @@ extension IPCMessage: Decodable {
             return .exportHar(try container.decode(HarExportResult.self, forKey: .result))
         case "import_har":
             return .importHar(try container.decode(HarImportResult.self, forKey: .result))
+        case "diagnostics":
+            return .diagnostics(try container.decode(CoreDiagnostics.self, forKey: .result))
         default:
             // A result this build cannot read is a disagreement about the
             // schema, and the version said there was none.

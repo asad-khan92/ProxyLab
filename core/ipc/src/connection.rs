@@ -41,8 +41,9 @@
 //! told how many exchanges it missed.
 //!
 //! Shutdown is not held up by such a client either: the stop signal is
-//! selected on around the write, so a server that is shutting down does not
-//! wait for a socket that will never drain.
+//! selected on around the write and around an operation that is still
+//! running, so a server that is shutting down does not wait for a socket
+//! that will never drain or for a replay that has not finished.
 //!
 //! # What is read
 //!
@@ -73,6 +74,7 @@ pub(crate) async fn serve(
     service: TrafficService,
     mut stopping: watch::Receiver<bool>,
 ) {
+    proxy_diagnostics::info("ipc", "connect", "connection", "a client connected");
     let (reader, writer) = stream.into_split();
     let mut connection = Connection {
         reader: BufReader::new(reader),
@@ -84,13 +86,23 @@ pub(crate) async fn serve(
         service,
     };
 
-    if let Err(error) = connection.run(&mut stopping).await {
-        // The client's connection and nobody else's. A client that hangs up
-        // mid-request is ordinary and not worth a line; anything else is
+    match connection.run(&mut stopping).await {
+        Ok(()) => {
+            proxy_diagnostics::info("ipc", "disconnect", "connection", "a client disconnected");
+        }
+        // A client that hangs up mid-request is ordinary. Anything else is
         // worth knowing about, and carries no traffic — an I/O error names a
         // syscall, not what was being written.
-        if !is_disconnect(&error) {
-            eprintln!("IPC client connection ended: {error}");
+        Err(error) if is_disconnect(&error) => {
+            proxy_diagnostics::info("ipc", "disconnect", "connection", "a client disconnected");
+        }
+        Err(error) => {
+            proxy_diagnostics::warn(
+                "ipc",
+                "disconnect",
+                "connection",
+                &format!("a client connection ended: {error}"),
+            );
         }
     }
 }
@@ -186,55 +198,46 @@ impl Connection {
                     None => {}
                     Some(Answer::Response(response)) => self.send(stopping, &response).await?,
                     Some(Answer::Traffic(id, operation)) => {
-                        let response = match self.service.execute(operation).await {
-                            Ok(outcome) => Response::ok(&id, outcome),
-                            Err(error) => Response::failed(Some(&id), error),
-                        };
-
-                        self.send(stopping, &response).await?;
+                        let result =
+                            unless_stopping(stopping, self.service.execute(operation)).await;
+                        self.reply(stopping, &id, result).await?;
                     }
                     Some(Answer::Rule(id, operation)) => {
-                        let response = match self.service.execute_rules(operation).await {
-                            Ok(outcome) => Response::ok(&id, outcome),
-                            Err(error) => Response::failed(Some(&id), error),
-                        };
-
-                        self.send(stopping, &response).await?;
+                        let result =
+                            unless_stopping(stopping, self.service.execute_rules(operation)).await;
+                        self.reply(stopping, &id, result).await?;
                     }
                     Some(Answer::Lan(id, operation)) => {
                         // Awaited here, like a replay: binding or closing a
                         // listening socket is quick, and no other connection
-                        // is held up by this one waiting for it.
-                        let response = match self.service.execute_lan(operation).await {
-                            Ok(outcome) => Response::ok(&id, outcome),
-                            Err(error) => Response::failed(Some(&id), error),
-                        };
-
-                        self.send(stopping, &response).await?;
+                        // is held up by this one waiting for it. Shutdown
+                        // still wins, so a bind that has not returned cannot
+                        // keep a stopping server alive.
+                        let result =
+                            unless_stopping(stopping, self.service.execute_lan(operation)).await;
+                        self.reply(stopping, &id, result).await?;
                     }
                     Some(Answer::Breakpoint(id, operation)) => {
-                        let response = match self.service.execute_breakpoints(operation).await {
-                            Ok(outcome) => Response::ok(&id, outcome),
-                            Err(error) => Response::failed(Some(&id), error),
-                        };
-
-                        self.send(stopping, &response).await?;
+                        let result =
+                            unless_stopping(stopping, self.service.execute_breakpoints(operation))
+                                .await;
+                        self.reply(stopping, &id, result).await?;
                     }
                     Some(Answer::Throttle(id, operation)) => {
-                        let response = match self.service.execute_throttle(operation).await {
-                            Ok(outcome) => Response::ok(&id, outcome),
-                            Err(error) => Response::failed(Some(&id), error),
-                        };
-
-                        self.send(stopping, &response).await?;
+                        let result =
+                            unless_stopping(stopping, self.service.execute_throttle(operation))
+                                .await;
+                        self.reply(stopping, &id, result).await?;
                     }
                     Some(Answer::Saved(id, operation)) => {
-                        let response = match self.service.execute_saved(operation).await {
-                            Ok(outcome) => Response::ok(&id, outcome),
-                            Err(error) => Response::failed(Some(&id), error),
-                        };
-
-                        self.send(stopping, &response).await?;
+                        let result =
+                            unless_stopping(stopping, self.service.execute_saved(operation)).await;
+                        self.reply(stopping, &id, result).await?;
+                    }
+                    Some(Answer::Diagnostics(id)) => {
+                        let result =
+                            unless_stopping(stopping, self.service.execute_diagnostics()).await;
+                        self.reply(stopping, &id, result).await?;
                     }
                     Some(Answer::Har(id, operation)) => {
                         // A HAR export or import is a file of tens of
@@ -243,12 +246,12 @@ impl Connection {
                         // has. It runs on a blocking thread like every other
                         // database call, and this client waits for its own
                         // answer while no other connection is held up.
-                        let response = match self.service.execute_har(operation).await {
-                            Ok(outcome) => Response::ok(&id, outcome),
-                            Err(error) => Response::failed(Some(&id), error),
-                        };
-
-                        self.send(stopping, &response).await?;
+                        // Stopping does not wait for it to finish: the
+                        // blocking work may still run, but the server does
+                        // not stay up for it.
+                        let result =
+                            unless_stopping(stopping, self.service.execute_har(operation)).await;
+                        self.reply(stopping, &id, result).await?;
                     }
                     Some(Answer::Developer(id, operation)) => {
                         // A replay is awaited here, which means this client
@@ -257,13 +260,13 @@ impl Connection {
                         // other connection is held up, and the traffic
                         // events it is subscribed to are queued for it the
                         // same way they are for a client that is slow for
-                        // any other reason.
-                        let response = match self.service.execute_developer(operation).await {
-                            Ok(outcome) => Response::ok(&id, outcome),
-                            Err(error) => Response::failed(Some(&id), error),
-                        };
-
-                        self.send(stopping, &response).await?;
+                        // any other reason. Shutdown abandons the wait, so
+                        // a destination that never answers cannot keep the
+                        // server from stopping.
+                        let result =
+                            unless_stopping(stopping, self.service.execute_developer(operation))
+                                .await;
+                        self.reply(stopping, &id, result).await?;
                     }
                 },
                 Step::Oversized => {
@@ -390,7 +393,30 @@ impl Connection {
             Operation::Throttle(operation) => Some(Answer::Throttle(request.id, operation)),
             Operation::Saved(operation) => Some(Answer::Saved(request.id, operation)),
             Operation::Har(operation) => Some(Answer::Har(request.id, operation)),
+            Operation::Diagnostics => Some(Answer::Diagnostics(request.id)),
         }
+    }
+
+    /// Writes the answer of an operation that has already been run.
+    ///
+    /// `None` means shutdown won, and this client is dropped without a
+    /// reply: the server is going away. The operation is awaited before
+    /// this is called, so the future is not held across the write.
+    async fn reply(
+        &mut self,
+        stopping: &mut watch::Receiver<bool>,
+        id: &protocol::RequestId,
+        result: Option<Result<Outcome, ErrorBody>>,
+    ) -> io::Result<()> {
+        let Some(result) = result else {
+            return Ok(());
+        };
+        let response = match result {
+            Ok(outcome) => Response::ok(id, outcome),
+            Err(error) => Response::failed(Some(id), error),
+        };
+
+        self.send(stopping, &response).await
     }
 
     /// Writes one message, giving up if the server is stopping.
@@ -437,6 +463,25 @@ enum Answer {
     Saved(protocol::RequestId, protocol::SavedRequestOperation),
     /// An operation that writes a HAR file, or reads one.
     Har(protocol::RequestId, protocol::HarOperation),
+    /// The process's own status.
+    Diagnostics(protocol::RequestId),
+}
+
+/// Runs `work` unless the server stops first.
+///
+/// Dropping the future is how a replay, a query, or a bind is abandoned.
+/// Work that already moved onto a blocking thread keeps running there; what
+/// this guarantees is that the connection task, and therefore the server,
+/// does not wait for it.
+async fn unless_stopping<T>(
+    stopping: &mut watch::Receiver<bool>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        () = stopped(stopping) => None,
+        result = work => Some(result),
+    }
 }
 
 /// Resolves when the server is stopping.

@@ -16,8 +16,13 @@ struct FlowPolicyTests {
     private let chrome = SourceProcess(pid: 501, pidVersion: 3)
     private let core = SourceProcess(pid: 812, pidVersion: 1)
 
-    private func flow(_ host: String, _ port: UInt16, from source: SourceProcess? = nil) -> FlowCandidate {
-        FlowCandidate(host: host, port: port, source: source ?? chrome)
+    private func flow(
+        _ host: String,
+        _ port: UInt16,
+        from source: SourceProcess? = nil,
+        transport: FlowTransport = .tcp
+    ) -> FlowCandidate {
+        FlowCandidate(host: host, port: port, source: source ?? chrome, transport: transport)
     }
 
     @Test("HTTP and HTTPS to the outside are handed to the core")
@@ -28,6 +33,51 @@ struct FlowPolicyTests {
         #expect(policy.decide(flow("93.184.215.14", 80)) == .bridge)
         #expect(policy.decide(flow("2606:2800:220:1::248", 443)) == .bridge)
         #expect(policy.decide(flow("example.com", 443)) == .bridge)
+    }
+
+    @Test("TCP 80 and TCP 443 are claimed, and other TCP ports are not")
+    func claimedPortsAreCounted() {
+        let policy = FlowPolicy()
+
+        #expect(policy.decide(flow("93.184.215.14", 80)) == .bridge)
+        #expect(policy.decide(flow("93.184.215.14", 443)) == .bridge)
+        #expect(policy.decide(flow("93.184.215.14", 8443)) == .leave(.port))
+
+        let counters = policy.status().counters
+        #expect(counters.claimedTcp80 == 1)
+        #expect(counters.claimedTcp443 == 1)
+        #expect(counters.bypassedPort == 1)
+        #expect(counters.bypassedUdp == 0)
+    }
+
+    @Test("UDP, including QUIC on 443, is left to macOS and counted")
+    func udpIsNotClaimed() {
+        let policy = FlowPolicy()
+
+        #expect(policy.decide(flow("93.184.215.14", 443, transport: .udp)) == .leave(.udp))
+        #expect(policy.decide(flow("93.184.215.14", 80, transport: .udp)) == .leave(.udp))
+        #expect(policy.decide(flow("2001:db8::1", 443, transport: .udp)) == .leave(.udp))
+        // Loopback is still loopback when it is UDP.
+        #expect(policy.decide(flow("127.0.0.1", 443, transport: .udp)) == .leave(.loopback))
+
+        let counters = policy.status().counters
+        #expect(counters.bypassedUdp == 3)
+        #expect(counters.bypassedLoopback == 1)
+        #expect(counters.claimedTcp443 == 0)
+        #expect(counters.bridged == 0)
+    }
+
+    @Test("the rules claim TCP 80 and 443 on IPv4 and IPv6, and do not ask for UDP")
+    func deliveredRules() {
+        #expect(FlowPolicy.deliveredRules == [
+            TransparentNetworkRule(transport: .tcp, port: 80, claimed: true),
+            TransparentNetworkRule(transport: .tcp, port: 443, claimed: true),
+        ])
+        #expect(FlowPolicy.deliveredRules.allSatisfy { $0.transport == .tcp && $0.claimed })
+        #expect(FlowPolicy.includedNetworks.map(\.address) == ["0.0.0.0", "::"])
+        #expect(FlowPolicy.excludedLoopback.map(\.address) == ["127.0.0.0", "::1"])
+        let claimed = Set(FlowPolicy.deliveredRules.filter(\.claimed).map(\.port))
+        #expect(claimed == FlowPolicy.interceptedPorts)
     }
 
     @Test("other ports are left to macOS")
@@ -63,6 +113,29 @@ struct FlowPolicyTests {
     @Test("a flow with no destination is left alone")
     func unreadable() {
         #expect(FlowPolicy().decide(flow("", 443)) == .leave(.unreadable))
+    }
+
+    @Test("an explicit proxy connection is not claimed, and the core's later upstream is not claimed again")
+    func explicitProxyDoesNotRecurseOrDuplicate() {
+        let policy = FlowPolicy()
+
+        // The client connects to 127.0.0.1:9090. Loopback is excluded, so the
+        // provider never sees that flow and cannot capture it a second time.
+        #expect(policy.decide(flow("127.0.0.1", 9_090)) == .leave(.loopback))
+        #expect(policy.decide(flow("127.0.0.1", 9_091)) == .leave(.loopback))
+        // A phone connects to the LAN listener. Port 9090 is not 80 or 443.
+        #expect(policy.decide(flow("192.168.1.25", 9_090)) == .leave(.port))
+
+        // The core's first upstream connection is offered once. The bridge
+        // answers 508 before it connects anywhere, and the provider learns
+        // the process. Later upstream connections are not claimed.
+        #expect(policy.decide(flow("93.184.215.14", 443, from: core)) == .bridge)
+        policy.learnProxyLab(core)
+        #expect(policy.decide(flow("93.184.215.14", 443, from: core)) == .leave(.proxyLab))
+        #expect(policy.decide(flow("93.184.215.14", 80, from: core)) == .leave(.proxyLab))
+
+        // Some other app that ignored the system proxy is still captured once.
+        #expect(policy.decide(flow("93.184.215.14", 443, from: chrome)) == .bridge)
     }
 
     @Test("a process the core called its own is never offered again")
@@ -127,7 +200,14 @@ struct FlowPolicyTests {
         _ = policy.decide(flow("93.184.215.14", 443), now: then)
 
         let status = policy.status()
-        #expect(status.counters == .init(bridged: 1, passedThrough: 2, proxyLab: 1))
+        #expect(status.counters == .init(
+            bridged: 1,
+            passedThrough: 2,
+            proxyLab: 1,
+            claimedTcp443: 3,
+            bypassedProxyLab: 1,
+            bridgeFallback: 2
+        ))
         #expect(status.bridge == .unreachable)
         #expect(status.lastBridgeFailure == "connection refused")
     }

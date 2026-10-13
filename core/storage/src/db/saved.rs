@@ -73,7 +73,7 @@ impl Storage {
         let config = self.config().clone();
         let staged = bodies::stage_saved(&config, saved.id, &saved.body)?;
 
-        let stored = self.with_connection(|connection| {
+        let stored = self.with_write(|connection| {
             let transaction = connection.transaction()?;
 
             transaction.execute(
@@ -97,7 +97,7 @@ impl Storage {
     pub fn saved_request(&self, id: SavedRequestId) -> Result<Option<SavedRequest>, StorageError> {
         let sql = format!("SELECT {SAVED_COLUMNS} FROM saved_requests WHERE id = ?1");
 
-        let stored = self.with_connection(|connection| {
+        let stored = self.with_read(|connection| {
             let stored = connection
                 .query_row(&sql, [id.as_text()], read)
                 .optional()?;
@@ -118,7 +118,7 @@ impl Storage {
             "SELECT {SAVED_COLUMNS} FROM saved_requests ORDER BY created_at_ms ASC, id ASC"
         );
 
-        let stored = self.with_connection(|connection| {
+        let stored = self.with_read(|connection| {
             let mut statement = connection.prepare(&sql)?;
             let rows = statement
                 .query_map([], read)?
@@ -132,7 +132,7 @@ impl Storage {
 
     /// How many saved requests are stored.
     pub fn count_saved_requests(&self) -> Result<u64, StorageError> {
-        self.with_connection(|connection| {
+        self.with_read(|connection| {
             let count: i64 =
                 connection
                     .query_row("SELECT COUNT(*) FROM saved_requests", [], |row| row.get(0))?;
@@ -168,7 +168,7 @@ impl Storage {
         let staged = bodies::stage_saved(&config, updated.id, &updated.body)?;
         let replaced = previous_file(self.stored_body_file(id)?, staged.placement());
 
-        let stored = self.with_connection(|connection| {
+        let stored = self.with_write(|connection| {
             let transaction = connection.transaction()?;
 
             let rows = transaction.execute(
@@ -215,7 +215,7 @@ impl Storage {
     pub fn delete_saved_request(&self, id: SavedRequestId) -> Result<bool, StorageError> {
         let file: Vec<String> = self.stored_body_file(id)?.into_iter().collect();
 
-        let removed = self.with_connection(|connection| {
+        let removed = self.with_write(|connection| {
             let removed =
                 connection.execute("DELETE FROM saved_requests WHERE id = ?1", [id.as_text()])?;
 
@@ -237,7 +237,7 @@ impl Storage {
     /// made when it was written, and the row is where that decision is
     /// recorded.
     fn stored_body_file(&self, id: SavedRequestId) -> Result<Option<String>, StorageError> {
-        self.with_connection(|connection| {
+        self.with_read(|connection| {
             let file = connection
                 .query_row(
                     "SELECT body_file FROM saved_requests WHERE id = ?1",

@@ -44,9 +44,9 @@ struct ConnectionIndicator: View {
 
     private var tint: Color {
         switch state {
-        case .connected: .green
-        case .connecting, .idle: .orange
-        case .disconnected: .red
+        case .connected: StatusTone.ready.color
+        case .connecting, .idle: StatusTone.pending.color
+        case .disconnected: StatusTone.fault.color
         }
     }
 }

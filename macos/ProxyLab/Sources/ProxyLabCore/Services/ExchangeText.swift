@@ -55,19 +55,20 @@ public enum ExchangeText {
 
     /// One body as text to put on the clipboard.
     ///
-    /// The whole captured body, not the shortened form the window draws: a
-    /// copy is how a developer gets at the part that was too long to show.
-    /// Bytes that are not text are Base64, because pasting them as characters
-    /// would paste something the server never sent.
+    /// The whole reading, not the shortened form the window draws: a copy is
+    /// how a developer gets at the part that was too long to show. The reading
+    /// is the capture after a declared Content-Encoding was removed. Bytes
+    /// that are still not text are Base64, because pasting them as characters
+    /// would paste something the server never sent. A save is a different
+    /// operation and writes the capture itself.
     public static func body(_ inspection: BodyInspection) -> String {
         switch inspection.content {
         case .empty:
             return ""
         case let .text(text):
-            return String(data: inspection.capture.data, encoding: text.encoding)
-                ?? text.text
+            return String(data: inspection.presented, encoding: text.encoding) ?? text.text
         case .image, .binary, .undecodable:
-            return base64(inspection.capture.data)
+            return base64(inspection.presented)
         }
     }
 

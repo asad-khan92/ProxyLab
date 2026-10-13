@@ -46,7 +46,7 @@ Load this file for Rust proxy-engine/core architecture, protocol flow, HTTP/1.1/
   | `Sources/SimulatorTools/SimulatorCommand.swift` | Running `xcrun simctl`, and nothing else |
   | `Sources/SimulatorTools/SimulatorCatalog.swift` | Which iOS Simulators are booted |
   | `Sources/SimulatorTools/SimulatorTrustStore.swift` | Making one trust ProxyLab's CA |
-  | `Sources/SimulatorTools/ProxyRoute.swift` | What a simulator will connect through, read and never written |
+  | `Sources/SimulatorTools/ProxyRoute.swift` | What a simulator will connect through. This type only reads; capture writes the Mac proxy |
   | `Sources/AndroidTools/AdbCommand.swift` | Running `adb`, by argument vector and never through a shell |
   | `Sources/AndroidTools/AdbLocation.swift` | Finding `adb` without depending on how ProxyLab was started |
   | `Sources/AndroidTools/EmulatorCatalog.swift` | Which Android Emulators are running |
@@ -241,7 +241,10 @@ deliberate structural decision, not an implementation detail.
 The reasons:
 
 - **The core must be usable without a UI.** Headless operation, CI runs, and
-  integration tests must not require launching an AppKit application.
+  integration tests must not require launching an AppKit application. The
+  macOS app may launch the bundled `proxy-engine` executable and stop the
+  process it started. That is a child process, not a dependency: the core
+  still builds, runs, and tests with no Swift present.
 - **Failure isolation.** A UI crash, hang, or restart must not drop live
   connections or lose captured traffic.
 - **Testability.** Protocol correctness, TLS behaviour, and rule evaluation are

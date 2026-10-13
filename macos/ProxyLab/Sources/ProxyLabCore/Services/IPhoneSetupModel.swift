@@ -37,6 +37,10 @@ public enum LanExposureState: Equatable, Sendable {
     case loading
     /// The proxy is on loopback and nothing else.
     case off
+    /// Local network access was turned on, and this Mac has no usable address.
+    /// The loopback listener is unaffected. A later address turns the LAN
+    /// listener back on without being asked again.
+    case waitingForNetwork
     /// The switch is in flight; the core has not answered yet.
     case working
     /// The proxy is also on this address and port.
@@ -63,6 +67,16 @@ public final class IPhoneSetupModel {
 
     private let session: any LanSession
 
+    /// The user turned local network access on and has not turned it off.
+    ///
+    /// Kept when the LAN listener is closed because there is no address, so
+    /// the listener comes back when an address does. Not written anywhere:
+    /// a new launch starts with it off, the same as the core does.
+    private var wantsLan = false
+
+    /// The interface the default route is using, when a network change said.
+    private var primaryInterface: String?
+
     /// Which request is the current one, so a slow answer to a switch that
     /// has been superseded does not replace what a newer one produced.
     private var generation = 0
@@ -88,8 +102,9 @@ public final class IPhoneSetupModel {
         !isWorking && !isOn && selected != nil
     }
 
-    /// Whether there is anything to turn off.
-    public var canDisable: Bool { !isWorking && isOn }
+    /// Whether there is anything to turn off, including a listener that is
+    /// waiting for an address to come back.
+    public var canDisable: Bool { !isWorking && (isOn || state == .waitingForNetwork) }
 
     /// What the status line says.
     public var statusText: String {
@@ -97,6 +112,7 @@ public final class IPhoneSetupModel {
         case .loading: "Checking…"
         case .working: "Working…"
         case .off: "Off — only this Mac can reach the proxy"
+        case .waitingForNetwork: "Waiting for a network — physical devices cannot reach the proxy"
         case let .on(endpoint): "On — \(endpoint)"
         case let .failed(reason): reason
         }
@@ -108,7 +124,7 @@ public final class IPhoneSetupModel {
     /// it says is only true while it is on: anything on this Wi-Fi can use
     /// the proxy, and there is no password on it.
     public var exposureWarning: String? {
-        guard isOn else { return nil }
+        guard case .on = state else { return nil }
 
         return "Any device on this Wi-Fi can use this proxy while it is on. "
             + "There is no password. Turn it off when you are done."
@@ -119,9 +135,40 @@ public final class IPhoneSetupModel {
     /// The selection is kept if the core still offers it, and replaced with
     /// the first address if it does not: a Mac that has changed networks has
     /// different addresses, and holding a stale one would offer a switch that
-    /// could only fail.
+    /// could only fail. This does not move the LAN listener. A network change
+    /// does that, through ``networkDidChange(primaryInterface:)``.
     public func refresh() async {
         await run { try await self.session.lanStatus() }
+    }
+
+    /// The network path changed. Refreshes the addresses the core offers and,
+    /// when local network access is on, moves or suspends the LAN listener.
+    ///
+    /// Loopback is not part of this. `127.0.0.1:9090` and `127.0.0.1:9091`
+    /// are not rebound because an interface changed.
+    public func networkDidChange(primaryInterface: String?) async {
+        self.primaryInterface = primaryInterface
+        await run(quiet: true) { try await self.session.lanStatus() }
+        guard wantsLan, lastError == nil, let status else { return }
+
+        switch LanMigration.action(
+            wantsLan: true,
+            enabled: status.enabled,
+            boundAddress: status.address,
+            available: status.available,
+            primaryInterface: primaryInterface
+        ) {
+        case .none:
+            break
+        case let .bind(address):
+            await run { try await self.session.enableLan(address: address) }
+        case .suspend:
+            await suspendListener()
+        case .wait:
+            if !status.enabled {
+                state = .waitingForNetwork
+            }
+        }
     }
 
     /// Puts the proxy on the selected address.
@@ -129,11 +176,22 @@ public final class IPhoneSetupModel {
         guard let selected else { return }
 
         await run { try await self.session.enableLan(address: selected) }
+        if isOn { wantsLan = true }
     }
 
-    /// Takes the proxy off the local network.
+    /// Takes the proxy off the local network, including when it is only
+    /// waiting for an address.
     public func disable() async {
+        wantsLan = false
+        if state == .waitingForNetwork && !isOn {
+            state = .off
+            return
+        }
         await run { try await self.session.disableLan() }
+        // A failed request did not close the listener. Keep following it.
+        if lastError != nil {
+            wantsLan = status?.enabled == true
+        }
     }
 
     /// The steps a developer follows on the phone.
@@ -168,10 +226,13 @@ public final class IPhoneSetupModel {
     public static let setupHost = "proxylab.test"
 
     /// Runs one core operation and draws whatever it produced.
-    private func run(_ operation: @escaping () async throws -> LanStatusResult) async {
+    private func run(
+        quiet: Bool = false,
+        _ operation: @escaping () async throws -> LanStatusResult
+    ) async {
         generation += 1
         let mine = generation
-        state = .working
+        if !quiet { state = .working }
         lastError = nil
 
         do {
@@ -188,24 +249,48 @@ public final class IPhoneSetupModel {
         }
     }
 
+    /// Closes the LAN listener and keeps the request for it, so an address
+    /// that comes back is bound without being asked for again.
+    private func suspendListener() async {
+        let wanted = wantsLan
+        await run { try await self.session.disableLan() }
+        wantsLan = wanted
+        if wantsLan, !isOn, lastError == nil {
+            state = .waitingForNetwork
+        }
+    }
+
     /// Takes the core's answer as the truth about what is listening.
     private func apply(_ status: LanStatusResult) {
         self.status = status
+        let boundUsable = status.enabled && status.address.map { bound in
+            status.available.contains { $0.address == bound }
+        } == true
 
-        if let bound = status.address {
-            // The proxy is on an address, so that is the address shown —
-            // whatever was picked before. A picker reading one address while
-            // the proxy is listening on another is how a developer types the
-            // wrong one into a phone.
+        if boundUsable, let bound = status.address {
+            // The proxy is on an address the Mac still has, so that is the
+            // address shown. A picker reading one address while the proxy is
+            // listening on another is how a developer types the wrong one
+            // into a phone.
             selected = bound
         } else if selected == nil
             || !status.available.contains(where: { $0.address == selected })
         {
-            // Nothing is bound, so keep what was picked if this Mac still
-            // offers it, and otherwise fall to the first address there is.
+            // Nothing usable is bound, so keep what was picked if this Mac
+            // still offers it, and otherwise fall to the first address there
+            // is. An address that is no longer offered is not kept: that is
+            // the stale LAN address.
             selected = status.available.first?.address
         }
 
-        state = status.endpoint.map(LanExposureState.on) ?? .off
+        if status.enabled { wantsLan = true }
+
+        if boundUsable, let endpoint = status.endpoint {
+            state = .on(endpoint: endpoint)
+        } else if wantsLan, status.available.isEmpty {
+            state = .waitingForNetwork
+        } else {
+            state = .off
+        }
     }
 }

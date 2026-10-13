@@ -3,10 +3,11 @@
 //  # What is asked for
 //
 //  Outbound TCP to ports 80 and 443, on IPv4 and IPv6, and nothing on
-//  loopback. That is the whole of the rule set — no UDP (so no QUIC and no
-//  DNS), no other ports, and no per-application rules. A flow macOS does not
-//  hand over is carried by macOS exactly as if this provider were not
-//  installed.
+//  loopback. No UDP, so no QUIC and no DNS, and no other ports. A flow macOS
+//  does not hand over is carried by macOS exactly as if this provider were
+//  not installed. UDP is left out of the rules rather than accepted and
+//  returned: on current macOS, returning false from the UDP flow handler
+//  terminates the flow.
 //
 //  Loopback is excluded for a reason beyond "it never leaves the Mac": the
 //  connection this provider opens to the core's bridge is loopback, and so is
@@ -65,14 +66,27 @@ final class TransparentProxyProvider: NETransparentProxyProvider, @unchecked Sen
     }
 
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
-        // The rules ask for TCP alone, so anything else is a flow this
-        // provider never meant to take.
-        guard let tcp = flow as? NEAppProxyTCPFlow,
-              let destination = FlowDestination(of: tcp)
-        else { return false }
-
         let source = flow.metaData.sourceAppAuditToken.flatMap(SourceProcess.init(auditToken:))
-        let candidate = FlowCandidate(host: destination.host, port: destination.port, source: source)
+
+        // UDP, including QUIC on 443. Returning false does not close it:
+        // for this provider, macOS then carries the flow itself. The flow
+        // is not opened, which is what would claim it.
+        guard let tcp = flow as? NEAppProxyTCPFlow else {
+            _ = policy.decide(FlowCandidate(host: "", port: 443, source: source, transport: .udp))
+            return false
+        }
+
+        guard let destination = FlowDestination(of: tcp) else {
+            _ = policy.decide(FlowCandidate(host: "", port: 0, source: source, transport: .tcp))
+            return false
+        }
+
+        let candidate = FlowCandidate(
+            host: destination.host,
+            port: destination.port,
+            source: source,
+            transport: .tcp
+        )
 
         guard policy.decide(candidate) == .bridge else { return false }
 
@@ -98,21 +112,20 @@ final class TransparentProxyProvider: NETransparentProxyProvider, @unchecked Sen
         completionHandler?(policy.status().encoded)
     }
 
-    /// Outbound TCP to the intercepted ports, anywhere but loopback.
+    /// The flows `FlowPolicy` names, on IPv4 and IPv6, and not on loopback.
     static func networkSettings() -> NETransparentProxyNetworkSettings {
         let settings = NETransparentProxyNetworkSettings(
             tunnelRemoteAddress: ProviderConfiguration.bridgeHost
         )
 
-        settings.includedNetworkRules = FlowPolicy.interceptedPorts.sorted().flatMap { port in
-            ["0.0.0.0", "::"].map { network in
-                rule(network: network, prefix: 0, port: port)
+        settings.includedNetworkRules = FlowPolicy.deliveredRules.flatMap { delivered in
+            FlowPolicy.includedNetworks.map { network in
+                rule(network: network.address, prefix: network.prefix, port: delivered.port)
             }
         }
-        settings.excludedNetworkRules = [
-            rule(network: "127.0.0.0", prefix: 8, port: nil),
-            rule(network: "::1", prefix: 128, port: nil),
-        ]
+        settings.excludedNetworkRules = FlowPolicy.excludedLoopback.map { network in
+            rule(network: network.address, prefix: network.prefix, port: nil)
+        }
 
         return settings
     }
@@ -121,7 +134,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider, @unchecked Sen
     ///
     /// macOS 15 replaced the endpoint type these rules are written in. The
     /// older one is still what macOS 14 has, and Swift reaches it under the
-    /// name the SDK keeps it at.
+    /// name the SDK keeps it at. The protocol is TCP: UDP is not asked for.
     private static func rule(network: String, prefix: Int, port: UInt16?) -> NENetworkRule {
         if #available(macOS 15.0, *) {
             return NENetworkRule(

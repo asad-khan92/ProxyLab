@@ -1,14 +1,7 @@
 //  The pieces the detail pane is built from.
 //
-//      ┌ HEADERS (12)                              [⧉] ┐
-//      │ name      value                               │
-//      └───────────────────────────────────────────────┘
-//
-//  A section, a two-column grid, and the small copy button that sits in a
-//  section's title row. They are here rather than beside the views that use
-//  them because the request half, the response half, and the overview are all
-//  the same shapes with different contents in them, and a pane where a heading
-//  is a different size in one tab than in another reads as two panes.
+//  A section title, a key and its value, and the timing bar. The key stays a
+//  fixed width when there is room and sits above the value when there is not.
 //
 //  Nothing here chooses a colour. The pane is drawn in the system's own
 //  hierarchy of label styles, so it follows the appearance the person set
@@ -67,72 +60,124 @@ struct FieldGrid: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        AdaptiveKeyColumn {
+            rows(stacked: false)
+        } narrow: {
+            rows(stacked: true)
+        }
+    }
+
+    private func rows(stacked: Bool) -> some View {
+        VStack(alignment: .leading, spacing: stacked ? 8 : 4) {
             ForEach(fields) { field in
-                HStack(alignment: .firstTextBaseline, spacing: 12) {
-                    Text(field.name)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 122, alignment: .leading)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(field.value)
-                            .font(.system(size: 11, design: .monospaced))
-                            .textSelection(.enabled)
-
-                        if let note = field.note {
-                            Text(note)
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                                .textSelection(.enabled)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
+                KeyValueRow(
+                    name: field.name,
+                    stacked: stacked,
+                    note: field.note
+                ) {
+                    Text(field.value)
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
                 }
             }
         }
     }
 }
 
-/// The small button that copies one thing.
-///
-/// A symbol and a tooltip rather than a word, because these sit in title rows
-/// beside each other and four buttons reading "Copy" say less than one.
-struct CopyButton: View {
-    let what: String
-    let perform: () -> Void
+/// A list of overview facts. The key column stays a fixed width.
+struct FactList: View {
+    let facts: [OverviewFact]
 
     var body: some View {
-        Button(action: perform) {
-            Image(systemName: "doc.on.doc")
-                .font(.system(size: 10))
+        AdaptiveKeyColumn {
+            rows(stacked: false)
+        } narrow: {
+            rows(stacked: true)
         }
-        .buttonStyle(.borderless)
-        .foregroundStyle(.secondary)
-        .help("Copy \(what)")
-        .accessibilityLabel("Copy \(what)")
+    }
+
+    private func rows(stacked: Bool) -> some View {
+        VStack(alignment: .leading, spacing: stacked ? 8 : 4) {
+            ForEach(facts) { fact in
+                KeyValueRow(name: fact.name, stacked: stacked, note: fact.note) {
+                    Text(fact.value)
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }
+        }
     }
 }
 
-/// One fact about an exchange, in the row under its URL.
-struct MetaChip: View {
-    let symbol: String?
-    let text: String
-    var help: String?
+/// Columns when the content is wide enough. A key above its value when it is not.
+struct AdaptiveKeyColumn<Wide: View, Narrow: View>: View {
+    @ViewBuilder var wide: () -> Wide
+    @ViewBuilder var narrow: () -> Narrow
 
     var body: some View {
-        HStack(spacing: 3) {
-            if let symbol {
-                Image(systemName: symbol)
-                    .font(.system(size: 9))
-            }
-            Text(text)
-                .font(.system(size: 10, design: .monospaced))
+        ViewThatFits(in: .horizontal) {
+            wide()
+                .frame(minWidth: InspectorMetrics.stackBreakpoint, alignment: .leading)
+            narrow()
         }
-        .foregroundStyle(.secondary)
-        .help(help ?? text)
+    }
+}
+
+/// One name and the value beside it, or under it.
+struct KeyValueRow<Value: View>: View {
+    let name: String
+    var stacked: Bool
+    var note: String?
+    @ViewBuilder var value: () -> Value
+
+    var body: some View {
+        if stacked {
+            VStack(alignment: .leading, spacing: 1) {
+                nameLabel
+                valueBlock
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                nameLabel
+                    .frame(width: InspectorMetrics.keyWidth, alignment: .leading)
+                valueBlock
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private var nameLabel: some View {
+        Text(name)
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var valueBlock: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            value()
+                .fixedSize(horizontal: false, vertical: true)
+            if let note {
+                Text(note)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+/// A single quiet line for a section that has nothing to show.
+struct InspectorEmptyNote: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 11))
+            .foregroundStyle(.tertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

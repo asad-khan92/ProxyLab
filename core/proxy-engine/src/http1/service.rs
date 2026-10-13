@@ -202,10 +202,18 @@ fn reject(
     rejection: &Rejection,
 ) -> Response<ProxyBody> {
     let response = error_response(rejection);
-    eprintln!(
-        "{}",
-        rejected_report(client, method, target, rejection, response.status())
-    );
+    let report = rejected_report(client, method, target, rejection, response.status());
+    match rejection {
+        Rejection::Upstream(_) => {
+            proxy_diagnostics::error("upstream", "connect", "connection", &report);
+        }
+        Rejection::Connect(_) => {
+            proxy_diagnostics::error("tls", "intercept", "certificate", &report);
+        }
+        Rejection::Target(_) | Rejection::UnsupportedVersion(_) => {
+            proxy_diagnostics::warn("proxy", "request", "request", &report);
+        }
+    }
 
     response
 }

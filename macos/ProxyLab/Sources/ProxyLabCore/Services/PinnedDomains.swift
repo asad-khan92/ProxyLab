@@ -149,7 +149,10 @@ public final class PinnedDomainsStore {
     /// Trimmed, and lowered the way `COLLATE NOCASE` lowers: the ASCII
     /// letters and nothing else. `nil` for something that is not a host name
     /// at all, which is what an exchange with no destination has.
-    static func key(_ host: String) -> String? {
+    ///
+    /// Not isolated to the main actor: it reads no preferences, and the
+    /// sidebar's selection and the domain list both compare hosts with it.
+    nonisolated static func key(_ host: String) -> String? {
         let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
 
         return trimmed.isEmpty ? nil : trimmed.asciiLowercased()
@@ -196,6 +199,34 @@ public enum PinnedDomainSelection: Hashable, Sendable {
         switch self {
         case .allTraffic: nil
         case let .domain(host): host
+        }
+    }
+
+    /// Two spellings of one host are one selection, because that is how the
+    /// host filter compares them. A pin written `API.example.com` and a
+    /// captured row written `api.example.com` highlight together.
+    public static func == (lhs: PinnedDomainSelection, rhs: PinnedDomainSelection) -> Bool {
+        switch (lhs, rhs) {
+        case (.allTraffic, .allTraffic):
+            return true
+        case let (.domain(left), .domain(right)):
+            let leftKey = PinnedDomainsStore.key(left)
+            let rightKey = PinnedDomainsStore.key(right)
+            if let leftKey, let rightKey { return leftKey == rightKey }
+
+            return left == right
+        default:
+            return false
+        }
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        switch self {
+        case .allTraffic:
+            hasher.combine(0)
+        case let .domain(host):
+            hasher.combine(1)
+            hasher.combine(PinnedDomainsStore.key(host) ?? host)
         }
     }
 }

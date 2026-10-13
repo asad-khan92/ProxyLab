@@ -47,7 +47,12 @@ pub async fn join(
     let (client_io, origin_io) = match tokio::try_join!(client, origin) {
         Ok(halves) => halves,
         Err(error) => {
-            eprintln!("{client_addr} WebSocket {url} never opened: {error}");
+            proxy_diagnostics::error(
+                "upstream",
+                "websocket",
+                "connection",
+                &format!("{client_addr} WebSocket {url} never opened: {error}"),
+            );
             return;
         }
     };
@@ -74,7 +79,12 @@ pub async fn join(
         Ok((from_client, from_origin)) => println!(
             "{client_addr} WebSocket closed {url} ({from_client} bytes up, {from_origin} down)"
         ),
-        Err(error) => eprintln!("{client_addr} WebSocket closed {url}: {error}"),
+        Err(error) => proxy_diagnostics::warn(
+            "upstream",
+            "websocket",
+            "connection",
+            &format!("{client_addr} WebSocket closed {url}: {error}"),
+        ),
     }
 }
 

@@ -5,12 +5,17 @@ Load this file for iOS Simulator, physical iPhone/LAN exposure, Android Emulator
 ## The iOS Simulator
 
 ```
-┌ iOS SIMULATOR             ↻ ┐
-│ [ iPhone 17 Pro — iOS 26.1 ▾]│   xcrun simctl list devices booted -j
-│ ● Connected — via 127.0.0.…  │
-│ [ Connect ]  [ Disconnect ]  │   xcrun simctl keychain … add-root-cert
-└──────────────────────────────┘   SCDynamicStoreCopyProxies (read)
+● iPhone 17 Pro                 the sidebar row
+  Connected · CA trusted
+
+  Routing    Explicit Proxy     opened from the row
+  Captured through This Mac
+  [ Disconnect ]
 ```
+
+The row does not name `127.0.0.1:9090`. Explicit Proxy, Transparent Capture,
+and Not Routed are the three paths, and Explicit Proxy is still this Mac's
+HTTP and HTTPS proxy when it points at the explicit listener. Connect is unchanged.
 
 ### A simulator has no proxy settings of its own
 
@@ -28,11 +33,11 @@ A simulator does not read a proxy configuration. It reads *ours*.
 So there is nothing per-simulator to set, nothing to save before setting it,
 and nothing to restore afterwards: **the preservation of a simulator's previous
 proxy configuration is satisfied by never having written one.** The only lever
-that would route a simulator is this Mac's own proxy configuration, and
-ProxyLab does not touch it — `ProxyRoute` reads through
-`SCDynamicStoreCopyProxies` and the write half of SystemConfiguration is
-deliberately not used, not wrapped, and not reachable from anything the
-interface can press.
+that routes a simulator is this Mac's own proxy configuration. Capture's Start
+sets that, after `127.0.0.1:9090` is listening, and Stop puts back the HTTP
+and HTTPS settings it saved. `ProxyRoute` only reads, through
+`SCDynamicStoreCopyProxies`. The write is the capture lifecycle's, not this
+panel's, and not `simctl`'s.
 
 ### What Connect does
 
@@ -42,13 +47,17 @@ Three things, in order, and it says which of them it got through:
 | --- | --- |
 | the core is running | the window's own IPC connection, not a second probe |
 | trust the CA | `simctl keychain <udid> add-root-cert`, Apple's documented command |
-| check the route | is this Mac proxied to `127.0.0.1:9090`? |
+| how traffic is captured | this Mac's HTTP and HTTPS proxy, when it is `127.0.0.1:9090`; otherwise transparent capture, when that is on |
 
-The third is a check, not a change. When the route already points at the proxy
-the simulator is connected and there is nothing left to do. When it does not,
-**the certificate is trusted all the same** and the interface says exactly what
-is missing — a half-success reported as a half-success, rather than a green dot
-over a simulator whose traffic nothing will capture.
+The third is a check, not a change. Trusting the CA is not a route. When this
+Mac's HTTP and HTTPS proxy points at `127.0.0.1:9090`, that is the simulator's
+route — including while transparent capture is also on, because the simulator
+connects to loopback and the Network Extension does not see that connection.
+`127.0.0.1:9091` is the bridge the extension talks to and is not shown here.
+Transparent capture is the route only when the system proxy does not point at
+the explicit listener. When the certificate is trusted and neither route is in
+place, the interface says exactly what is missing. Connecting a simulator does
+not write the proxy; Start and Stop do.
 
 Connecting twice is two of the same command: `add-root-cert` exits zero for a
 certificate the simulator already trusts, which is the whole of the
@@ -58,8 +67,9 @@ Apple's back.
 
 ### What Disconnect does
 
-It ends the session the app is keeping, and says what it did not undo. No proxy
-setting was changed, so none is put back. The CA stays trusted, because
+It ends the session the app is keeping, and says what it did not undo. Connecting
+did not change a proxy setting, so disconnecting does not put one back. Capture's
+Stop restores the Mac proxy it saved. The CA stays trusted, because
 `simctl keychain` can add a certificate or `reset` the entire keychain and
 nothing in between — and erasing a developer's simulator keychain is not the
 opposite of adding one certificate to it. Both are said in the interface rather
@@ -82,22 +92,28 @@ answering.
 
 ### What is not here
 
-No physical iPhone, no Android, no Network Extension, no transparent proxying,
-and no automatic configuration of this Mac's proxy. Nothing boots, erases,
-resets or shuts down a simulator. Nothing is installed into the macOS Keychain.
-The proxy engine is untouched by all of it: this feature runs two command-line
-tools and reads one system dictionary, and reaches the core for exactly one
-thing — whether it is running.
+No physical iPhone and no Android. This panel does not install or switch the
+Network Extension — This Mac does that — and it does not configure this Mac's
+proxy. Capture does, on Start and Stop. Nothing boots, erases, resets or shuts
+down a simulator. Nothing in this panel is installed into the macOS
+keychain. Capture trusts the same certificate file for this user, and a
+simulator's trust store is a separate record: connecting a simulator does
+not satisfy that check. The proxy
+engine is untouched by the simulator panel: it runs `simctl` and reads one
+system dictionary. Whether the system proxy points at the explicit listener,
+and whether transparent capture is on, are read from the route and from the
+capture lifecycle the window already has.
 
 ## The physical iPhone
 
 ```
-┌ IPHONE                     ↻ ┐
-│ ● Off — only this Mac can …  │   lan_status
-│ [ en0 — 192.168.1.42       ▾]│
-│ [ Turn On ]      [ Setup… ]  │   enable_lan / disable_lan
-└──────────────────────────────┘
+● Physical iPhone
+  Ready on 192.168.1.42:9090     the LAN address, not the simulator route
 ```
+
+The row follows the network observer. While there is no usable address it
+says it is waiting for a local network. Enabling access is `enable_lan`; the
+certificate steps open from the detail.
 
 ### It is one address, chosen, and it is off until then
 
@@ -124,10 +140,14 @@ are all refused.
 
 `lan::discovery` reads the interfaces through `getifaddrs` each time it is
 asked, and keeps none of it: a Mac moves between networks, and a list that was
-true five minutes ago is a list of addresses that no longer bind. What is left
-out is loopback, an interface that is not up and running, a point-to-point
-interface (a VPN's `utun`), and a link-local `169.254` address — none of them
-is a Wi-Fi a phone is on.
+true five minutes ago is a list of addresses that no longer bind. The app
+watches the network path and asks again when it changes. While local network
+access is on, an address that has gone is unbound and the new one is bound;
+when none is usable the LAN listener is closed and the panel waits, and
+`127.0.0.1:9090` keeps serving this Mac. Local network access that is off is
+not turned on by that change. What is left out is loopback, an interface that
+is not up and running, a point-to-point interface (a VPN's `utun`), and a
+link-local `169.254` address — none of them is a Wi-Fi a phone is on.
 
 And anything that is not RFC 1918. That last filter is about safety rather
 than usefulness: binding the proxy to a publicly routable address would put an
@@ -183,13 +203,14 @@ sheet both say so, because the second one is the step everybody misses.
 ### What is not here
 
 No automatic configuration of the phone, no USB, no Xcode, no device
-management, and no app installed on it. Nothing changes this Mac's system
-proxy settings, its firewall, or its keychain — turning this on adds a
-listening socket, and that is the whole of what changes on this machine.
-There is no authentication on the LAN listener either: the boundary ProxyLab
-has is the IPC socket's file permissions, and that boundary does not stretch
-over a network. So the interface says, in a sentence and not a coloured dot,
-that any device on this Wi-Fi can use the proxy while it is on.
+management, and no app installed on it. Turning this on adds a listening
+socket. It does not by itself change this Mac's system proxy — that is
+capture's Start and Stop, and it points at `127.0.0.1:9090`, not at the LAN
+address. The LAN address is what a phone types in. There is no authentication
+on the LAN listener either: the boundary ProxyLab has is the IPC socket's file
+permissions, and that boundary does not stretch over a network. So the
+interface says, in a sentence and not a coloured dot, that any device on this
+Wi-Fi can use the proxy while it is on.
 
 The IPC socket itself is unmoved by all of this. Local network access widens
 what can reach the *proxy*; the captured traffic, the rules and the controls
@@ -211,6 +232,9 @@ The iOS Simulator has no proxy configuration of its own and reads this Mac's.
 An emulator has exactly one — `global http_proxy` — and `adb` can read and
 write it. So Connect here is a change rather than a check, and everything about
 the design is about making that change exactly reversible.
+
+The sidebar row names the emulator and says Connected or Needs CA setup. It
+does not show `10.0.2.2`; that alias stays the address Connect writes.
 
 **No second listener, and no LAN exposure.** `10.0.2.2` inside the standard
 emulator is an alias for the host's loopback interface, so the proxy the core

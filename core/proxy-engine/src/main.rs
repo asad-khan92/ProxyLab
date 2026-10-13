@@ -71,9 +71,11 @@
 //! explicit listener has — interception, upstream pool, capture, rules and
 //! controls — so a captured flow is traffic like any other.
 
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use proxy_diagnostics::Buffer;
 use proxy_engine::capture::Capture;
 use proxy_engine::controls::Controls;
 use proxy_engine::lan::{self, discovery, LanExposure};
@@ -82,7 +84,10 @@ use proxy_engine::replay::Replayer;
 use proxy_engine::status;
 use proxy_engine::transparent::{Own, DEFAULT_TRANSPARENT_ADDR};
 use proxy_engine::upstream::UpstreamManager;
-use proxy_ipc::{load_rules, IpcConfig, IpcServer, TrafficService};
+use proxy_ipc::{
+    load_rules, DiagnosticsControl, DiagnosticsFacts, EndpointStatus, IpcConfig, IpcServer,
+    TrafficService,
+};
 use proxy_storage::{Storage, StorageConfig, StorageWorker};
 use proxy_tls::{CertificateAuthority, Interceptor};
 use rules::RuleEngine;
@@ -90,10 +95,17 @@ use tokio::sync::watch;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let recent = proxy_diagnostics::install();
+
     let ca_directory = match CertificateAuthority::default_directory() {
         Ok(directory) => directory,
         Err(error) => {
-            eprintln!("Failed to work out where to keep the development CA: {error}");
+            proxy_diagnostics::error(
+                "tls",
+                "startup",
+                "certificate",
+                &format!("failed to work out where to keep the development CA: {error}"),
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -101,7 +113,12 @@ async fn main() -> ExitCode {
     let interceptor = match Interceptor::with_ca_in(&ca_directory) {
         Ok(interceptor) => Arc::new(interceptor),
         Err(error) => {
-            eprintln!("Failed to prepare the development CA: {error}");
+            proxy_diagnostics::error(
+                "tls",
+                "startup",
+                "certificate",
+                &format!("failed to prepare the development CA: {error}"),
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -120,12 +137,23 @@ async fn main() -> ExitCode {
     let listener = match Listener::bind(DEFAULT_LISTEN_ADDR).await {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("Failed to listen on {DEFAULT_LISTEN_ADDR}: {error}");
+            proxy_diagnostics::error(
+                "listener",
+                "bind",
+                "bind",
+                &format!("failed to listen on {DEFAULT_LISTEN_ADDR}: {error}"),
+            );
             return ExitCode::FAILURE;
         }
     };
 
     let listen_addr = listener.local_addr();
+    proxy_diagnostics::info(
+        "proxy",
+        "startup",
+        "lifecycle",
+        &format!("listening on {listen_addr}"),
+    );
     println!("{}", status::startup_report(listen_addr, &ca_directory));
 
     // Where the transparent proxy provider hands over the flows it captures.
@@ -133,8 +161,13 @@ async fn main() -> ExitCode {
     let transparent = match Listener::bind(DEFAULT_TRANSPARENT_ADDR).await {
         Ok(bridge) => Some(bridge),
         Err(error) => {
-            eprintln!(
-                "Failed to listen for transparent capture on {DEFAULT_TRANSPARENT_ADDR}: {error}"
+            proxy_diagnostics::warn(
+                "bridge",
+                "bind",
+                "bind",
+                &format!(
+                    "failed to listen for transparent capture on {DEFAULT_TRANSPARENT_ADDR}: {error}"
+                ),
             );
             None
         }
@@ -188,7 +221,12 @@ async fn main() -> ExitCode {
                 // under no rules at all, which is the safe direction: a
                 // half-loaded rule set could block or reroute traffic in a
                 // way nobody configured.
-                eprintln!("Failed to load rules; none will be applied: {error}");
+                proxy_diagnostics::warn(
+                    "rules",
+                    "load",
+                    "evaluation",
+                    &format!("failed to load rules; none will be applied: {error}"),
+                );
                 rules::RuleSet::empty()
             }
         };
@@ -237,6 +275,9 @@ async fn main() -> ExitCode {
         (Some(storage), Some(engine)) => match bind_ipc() {
             Ok(server) => Some((
                 server,
+                // The binds above are the listener state. Diagnostics reads
+                // them, and reads LAN exposure from the same control the LAN
+                // operations use.
                 TrafficService::new(storage.clone(), publisher)
                     .publishing_streams(stream_publisher)
                     .serving_rules(Arc::clone(engine))
@@ -247,10 +288,20 @@ async fn main() -> ExitCode {
                     )
                     .throttling_with(
                         Arc::clone(controls.throttle()) as Arc<dyn proxy_ipc::ThrottleControl>
-                    ),
+                    )
+                    .reporting(Arc::new(CoreDiagnostics {
+                        localhost: listen_addr,
+                        transparent: transparent.as_ref().map(|bridge| bridge.local_addr()),
+                        recent,
+                    }) as Arc<dyn DiagnosticsControl>),
             )),
             Err(error) => {
-                eprintln!("Failed to start the IPC server: {error}");
+                proxy_diagnostics::error(
+                    "ipc",
+                    "bind",
+                    "bind",
+                    &format!("failed to start the IPC server: {error}"),
+                );
                 return ExitCode::FAILURE;
             }
         },
@@ -302,7 +353,12 @@ async fn main() -> ExitCode {
             let (proxied, served) =
                 tokio::join!(proxying, server.run(service, stopped(ipc_signal)));
             if let Err(error) = served {
-                eprintln!("IPC server stopped: {error}");
+                proxy_diagnostics::error(
+                    "ipc",
+                    "shutdown",
+                    "connection",
+                    &format!("IPC server stopped: {error}"),
+                );
             }
 
             proxied
@@ -316,8 +372,18 @@ async fn main() -> ExitCode {
     if let Some(bridging) = bridging {
         match bridging.await {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => eprintln!("Transparent capture stopped: {error}"),
-            Err(error) => eprintln!("Transparent capture stopped: {error}"),
+            Ok(Err(error)) => proxy_diagnostics::error(
+                "bridge",
+                "shutdown",
+                "connection",
+                &format!("transparent capture stopped: {error}"),
+            ),
+            Err(error) => proxy_diagnostics::error(
+                "bridge",
+                "shutdown",
+                "connection",
+                &format!("transparent capture stopped: {error}"),
+            ),
         }
     }
 
@@ -333,10 +399,16 @@ async fn main() -> ExitCode {
     }
 
     if let Err(error) = outcome {
-        eprintln!("Proxy engine stopped: {error}");
+        proxy_diagnostics::error(
+            "proxy",
+            "shutdown",
+            "lifecycle",
+            &format!("proxy engine stopped: {error}"),
+        );
         return ExitCode::FAILURE;
     }
 
+    proxy_diagnostics::info("proxy", "shutdown", "lifecycle", "shutting down");
     println!("Shutting down.");
     ExitCode::SUCCESS
 }
@@ -366,7 +438,12 @@ fn open_storage() -> Option<Storage> {
     let config = match StorageConfig::default_location() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("Failed to work out where to keep captured traffic: {error}");
+            proxy_diagnostics::error(
+                "storage",
+                "startup",
+                "storage",
+                &format!("failed to work out where to keep captured traffic: {error}"),
+            );
             return None;
         }
     };
@@ -374,8 +451,58 @@ fn open_storage() -> Option<Storage> {
     match Storage::open(config) {
         Ok(storage) => Some(storage),
         Err(error) => {
-            eprintln!("Failed to open the traffic database: {error}");
+            proxy_diagnostics::error(
+                "storage",
+                "startup",
+                "storage",
+                &format!("failed to open the traffic database: {error}"),
+            );
             None
+        }
+    }
+}
+
+/// The listener facts diagnostics reports, and the recent-error buffer.
+///
+/// LAN exposure is not stored here. It changes while the process runs, and
+/// the LAN control is asked when a client asks.
+#[derive(Debug)]
+struct CoreDiagnostics {
+    localhost: SocketAddr,
+    transparent: Option<SocketAddr>,
+    recent: Arc<Buffer>,
+}
+
+impl DiagnosticsControl for CoreDiagnostics {
+    fn facts(&self) -> DiagnosticsFacts {
+        use proxy_ipc::{ComponentStatus, OPEN};
+
+        DiagnosticsFacts {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            localhost: EndpointStatus::listening(self.localhost.to_string()),
+            transparent: match self.transparent {
+                Some(address) => EndpointStatus::listening(address.to_string()),
+                None => {
+                    EndpointStatus::unavailable("the transparent capture bridge is not listening")
+                }
+            },
+            storage: ComponentStatus::ok(OPEN),
+            recent: self
+                .recent
+                .recent()
+                .into_iter()
+                .map(|record| proxy_ipc::DiagnosticEvent {
+                    level: record.level.as_str().to_owned(),
+                    component: record.component.to_owned(),
+                    operation: record.operation.to_owned(),
+                    category: record.category.to_owned(),
+                    message: record.message,
+                    endpoint: record.endpoint,
+                    exchange_id: record.exchange_id,
+                    duration_ms: record.duration_ms,
+                    at_ms: record.at_ms,
+                })
+                .collect(),
         }
     }
 }
@@ -387,6 +514,11 @@ fn open_storage() -> Option<Storage> {
 /// without a way to stop it.
 async fn ctrl_c() {
     if let Err(error) = tokio::signal::ctrl_c().await {
-        eprintln!("Failed to wait for Ctrl+C: {error}");
+        proxy_diagnostics::error(
+            "proxy",
+            "shutdown",
+            "lifecycle",
+            &format!("failed to wait for Ctrl+C: {error}"),
+        );
     }
 }

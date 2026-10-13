@@ -238,5 +238,6 @@ struct PinnedDomainsStoreTests {
         #expect(PinnedDomainSelection(host: "api.example.com") == .domain("api.example.com"))
         #expect(PinnedDomainSelection.allTraffic.host == nil)
         #expect(PinnedDomainSelection.domain("api.example.com").host == "api.example.com")
+        #expect(PinnedDomainSelection.domain("API.example.com") == .domain("api.example.com"))
     }
 }

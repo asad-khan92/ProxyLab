@@ -40,7 +40,13 @@ struct PauseEditorView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if editor.direction != .websocket {
+                        label("Overview")
+                    }
                     line
+                    if editor.direction == .request, showsQuery {
+                        querySection
+                    }
                     if editor.direction != .websocket {
                         headerSection
                     }
@@ -60,8 +66,8 @@ struct PauseEditorView: View {
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Label(
-                "\(editor.direction.title) held",
-                systemImage: editor.direction.symbol
+                PausedHoldLabel.phase(editor.direction),
+                systemImage: "pause.fill"
             )
             .font(.system(size: 12, weight: .medium))
 
@@ -74,14 +80,66 @@ struct PauseEditorView: View {
 
             Spacer()
 
-            if model.queuedCount > 0 {
-                Text("\(model.queuedCount) more waiting")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+            if model.paused.count > 1 {
+                holdPicker
             }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    /// The other exchanges still held, so this one can be chosen without
+    /// losing them.
+    private var holdPicker: some View {
+        Menu {
+            ForEach(model.paused) { pause in
+                Button {
+                    model.selectPause(pause.pauseID)
+                } label: {
+                    if pause.pauseID == editor.paused.pauseID {
+                        Label(holdTitle(pause), systemImage: "checkmark")
+                    } else {
+                        Text(holdTitle(pause))
+                    }
+                }
+            }
+        } label: {
+            Text(PausedHoldLabel.count(model.paused.count))
+                .font(.system(size: 11))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Choose which held exchange to edit")
+    }
+
+    private func holdTitle(_ pause: PausedExchange) -> String {
+        let row = PausedTrafficRowContent(pause)
+
+        return "\(row.title) · \(row.detail)"
+    }
+
+    private var showsQuery: Bool {
+        URLComponents(string: editor.url)?.host != nil
+    }
+
+    /// The query, edited as part of the URL the core already accepts.
+    private var querySection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            label("Query")
+            TextField("Query", text: query, prompt: Text("none"))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+            Text("Part of the URL. Leave it blank to send the request without a query.")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private var query: Binding<String> {
+        Binding(
+            get: { PauseEditorModel.query(in: bindable.url) },
+            set: { bindable.url = PauseEditorModel.url(bindable.url, replacingQuery: $0) }
+        )
     }
 
     /// The request line, or the status.
@@ -191,21 +249,28 @@ struct PauseEditorView: View {
 
             Spacer()
 
-            Button(editor.direction == .websocket ? "Drop Message" : "Cancel Exchange", role: .destructive) {
+            Button(editor.direction == .websocket ? "Drop Message" : "Drop", role: .destructive) {
                 Task { await model.cancelPause() }
             }
-            .help(
-                editor.direction == .websocket
-                    ? "Drop this text message. The connection stays open."
-                    : "Send nothing. The origin is not contacted, or the client is not answered."
-            )
+            .help(dropHelp)
             .disabled(isBusy)
+
+            if editor.direction != .websocket {
+                Button("Continue Without Changes") {
+                    Task { await model.continueUnchanged() }
+                }
+                .help(
+                    "Send the captured message. Edits on screen are left unsent, "
+                        + "and a body too long to show is forwarded in full."
+                )
+                .disabled(isBusy)
+            }
 
             Button("Continue") {
                 Task { await model.continuePause() }
             }
             .keyboardShortcut(.defaultAction)
-            .help("Send what is on screen")
+            .help(continueHelp)
             .disabled(isBusy || editor.refusal != nil)
         }
         .padding(.horizontal, 16)
@@ -215,6 +280,28 @@ struct PauseEditorView: View {
 
     private var isBusy: Bool {
         model.busyIDs.contains(editor.paused.pauseID)
+    }
+
+    private var dropHelp: String {
+        switch editor.direction {
+        case .websocket:
+            "Drop this text message. The connection stays open."
+        case .request:
+            "Stop this request. It is not sent, and the exchange is still recorded."
+        case .response:
+            "Stop this response. The client is not given it, and the exchange is still recorded."
+        }
+    }
+
+    private var continueHelp: String {
+        switch editor.direction {
+        case .websocket:
+            "Send the payload on screen."
+        case .request:
+            "Send the edited request."
+        case .response:
+            "Send the edited response."
+        }
     }
 
     // MARK: - Bits

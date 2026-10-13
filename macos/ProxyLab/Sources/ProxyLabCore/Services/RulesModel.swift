@@ -12,6 +12,9 @@
 //  and the way to be sure of that is to never hold an order of this app's own.
 //  Every change is followed by asking for the list again.
 //
+//  A category and a search narrow that list. They are not a second collection
+//  and they do not sort it. Moving a row writes priorities for the full order.
+//
 //  # Nothing changes on screen before the core says it changed
 //
 //  Turning a rule off, moving one, and deleting one all go to the core first.
@@ -49,6 +52,10 @@ public enum RulesPlaceholder: Equatable, Sendable {
     case failed(String)
     /// The core has no rules at all.
     case noRules
+    /// The core has rules, and none of them are the selected kind.
+    case emptyCategory(String)
+    /// The core has rules, and none of them match the search.
+    case noMatches
 }
 
 /// The step between the priorities the list assigns when rules are reordered.
@@ -67,10 +74,18 @@ public final class RulesModel {
     public private(set) var rules: [Rule] = []
     /// Which rule the detail pane is showing.
     public var selectedID: String?
+    /// Which kind of rule the list is narrowed to. The collection is the same
+    /// one either way.
+    public var category: RulesCategory = .all
+    /// The list search. A substring of the words a row shows, composed with
+    /// ``category``. Empty shows every rule in the category.
+    public var searchText = ""
     /// The last thing that went wrong, for the status bar.
     public private(set) var lastError: String?
     /// The rule the editor is open on, if it is.
     public private(set) var editor: RuleEditorModel?
+    /// A rule action started from a traffic row, while its chooser is open.
+    public private(set) var trafficRule: TrafficRuleRequest?
     /// The rule a delete is waiting to be confirmed for.
     public var deleting: Rule?
     /// Which rules have a change in flight, so their controls can be disabled
@@ -96,20 +111,40 @@ public final class RulesModel {
         return rules.first { $0.id == selectedID }
     }
 
+    /// The rules the list is showing: ``category``, then the search, in the
+    /// order the core consults them. Nothing here sorts.
+    public var visibleRules: [Rule] {
+        rules.filter { category.contains($0) && RuleSearch.matches($0, query: searchText) }
+    }
+
     /// What the list should say when it has no rows.
     public var placeholder: RulesPlaceholder {
-        guard rules.isEmpty else { return .rules }
-
-        switch state {
-        case .loading: return .loading
-        case let .failed(reason): return .failed(reason)
-        case .loaded: return .noRules
+        if rules.isEmpty {
+            switch state {
+            case .loading: return .loading
+            case let .failed(reason): return .failed(reason)
+            case .loaded: return .noRules
+            }
         }
+
+        guard visibleRules.isEmpty else { return .rules }
+
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !query.isEmpty { return .noMatches }
+
+        return .emptyCategory(category.emptyTitle)
     }
 
     /// How many rules are enabled.
     public var enabledCount: Int {
         rules.count { $0.enabled }
+    }
+
+    /// How many rules ``category`` contains, ignoring the search.
+    ///
+    /// The counts beside the categories stay put while a search is typed.
+    public func count(in category: RulesCategory) -> Int {
+        rules.count { category.contains($0) }
     }
 
     // MARK: - Loading
@@ -173,35 +208,75 @@ public final class RulesModel {
 
     // MARK: - The order rules are consulted in
 
-    /// Whether `rule` can be moved further up the order.
+    /// Whether `rule` can be moved further up the list that is showing.
+    ///
+    /// That list is the consultation order, narrowed by the category and the
+    /// search. Moving up passes whatever the filter is hiding between this
+    /// rule and the one above it, and leaves every other rule in the same
+    /// order relative to the rest.
     public func canMoveUp(_ rule: Rule) -> Bool {
-        guard let index = rules.firstIndex(where: { $0.id == rule.id }) else { return false }
+        guard busyIDs.isEmpty, let index = visibleRules.firstIndex(where: { $0.id == rule.id })
+        else {
+            return false
+        }
 
-        return index > 0 && busyIDs.isEmpty
+        return index > 0
     }
 
-    /// Whether `rule` can be moved further down it.
+    /// Whether `rule` can be moved further down the list that is showing.
     public func canMoveDown(_ rule: Rule) -> Bool {
-        guard let index = rules.firstIndex(where: { $0.id == rule.id }) else { return false }
+        guard busyIDs.isEmpty, let index = visibleRules.firstIndex(where: { $0.id == rule.id })
+        else {
+            return false
+        }
 
-        return index < rules.count - 1 && busyIDs.isEmpty
+        return index < visibleRules.count - 1
     }
 
-    /// Moves `rule` one place earlier in the order rules are consulted in.
+    /// Moves `rule` one place earlier in the list that is showing.
     public func moveUp(_ rule: Rule) async {
-        guard let index = rules.firstIndex(where: { $0.id == rule.id }), index > 0 else { return }
+        guard let index = visibleRules.firstIndex(where: { $0.id == rule.id }), index > 0 else {
+            return
+        }
 
-        await reorder(moving: index, to: index - 1)
+        await moveVisible(from: index, to: index - 1)
     }
 
-    /// Moves `rule` one place later in it.
+    /// Moves `rule` one place later in the list that is showing.
     public func moveDown(_ rule: Rule) async {
-        guard let index = rules.firstIndex(where: { $0.id == rule.id }), index < rules.count - 1
+        guard let index = visibleRules.firstIndex(where: { $0.id == rule.id }),
+            index < visibleRules.count - 1
         else {
             return
         }
 
-        await reorder(moving: index, to: index + 1)
+        await moveVisible(from: index, to: index + 2)
+    }
+
+    /// Moves the visible rows `source` describes to `destination`.
+    ///
+    /// `destination` is the index to insert before, in the visible list as it
+    /// is before the move. One row at a time: a drag moves one rule.
+    public func moveVisible(from source: IndexSet, to destination: Int) async {
+        guard source.count == 1, let source = source.first else { return }
+
+        await moveVisible(from: source, to: destination)
+    }
+
+    /// Moves the visible rule at `source` to `destination`.
+    ///
+    /// See ``RuleOrder`` for where that lands in the full consultation order.
+    /// The priorities written afterwards are the same steps an unfiltered move
+    /// writes: ``rulePriorityStep`` from the top, and only where the number
+    /// actually changes.
+    public func moveVisible(from source: Int, to destination: Int) async {
+        guard busyIDs.isEmpty else { return }
+        guard let order = RuleOrder.moving(rules, visible: visibleRules, from: source, to: destination)
+        else {
+            return
+        }
+
+        await persist(order)
     }
 
     /// Writes a new order by writing new priorities, then reloads.
@@ -215,12 +290,10 @@ public final class RulesModel {
     /// Renumbering rather than swapping two numbers, because two rules may sit
     /// at the same priority — the core breaks that tie by id, which is not
     /// something a person can move a rule past. Spacing them out is what makes
-    /// the displayed order a thing the core will agree with.
-    private func reorder(moving index: Int, to destination: Int) async {
-        var order = rules
-        let moved = order.remove(at: index)
-        order.insert(moved, at: destination)
-
+    /// the displayed order a thing the core will agree with. A rule that did
+    /// not move can still be given a new number when the spacing requires it;
+    /// its place relative to the other rules that did not move does not change.
+    private func persist(_ order: [Rule]) async {
         let changes = order.enumerated()
             .map { (rule: $0.element, priority: Int32($0.offset) * rulePriorityStep) }
             .filter { $0.rule.priority != $0.priority }
@@ -250,16 +323,62 @@ public final class RulesModel {
         lastError = failure
     }
 
+    /// The rules whose action is `kind`, in the order the core consults them.
+    public func rules(of kind: RuleActionKind) -> [Rule] {
+        rules.filter { $0.action.kind == kind }
+    }
+
+    // MARK: - From a traffic row
+
+    /// Opens the chooser for `request`: the rules of that kind, and the way
+    /// to write a new one from the exchange.
+    public func beginTrafficRule(_ request: TrafficRuleRequest) {
+        editor = nil
+        deleting = nil
+        trafficRule = request
+    }
+
+    /// Closes the chooser without writing a rule.
+    public func cancelTrafficRule() {
+        trafficRule = nil
+    }
+
+    /// Turns `rule` on, if it is off, and closes the chooser once that has
+    /// happened. A rule that is already on is already applied.
+    @discardableResult
+    public func applyRule(_ rule: Rule) async -> Bool {
+        if !rule.enabled {
+            await setEnabled(true, for: rule)
+            guard rules.contains(where: { $0.id == rule.id && $0.enabled }) else { return false }
+        }
+
+        trafficRule = nil
+
+        return true
+    }
+
     // MARK: - The editor
 
     /// Opens the editor on a new rule of `kind`.
-    public func beginCreating(_ kind: RuleActionKind) {
-        editor = RuleEditorModel(creating: kind, session: session, chooser: chooser)
+    ///
+    /// `seed` fills the fields a captured exchange can supply. The editor is
+    /// still a draft until it is saved.
+    public func beginCreating(_ kind: RuleActionKind, seed: RuleDraftSeed? = nil) {
+        editor = RuleEditorModel(creating: kind, seed: seed, session: session, chooser: chooser)
     }
 
     /// Opens the editor on a rule that exists.
     public func beginEditing(_ rule: Rule) {
         editor = RuleEditorModel(editing: rule, session: session, chooser: chooser)
+    }
+
+    /// Opens the editor on a new rule copied from `rule`.
+    ///
+    /// The copy is a draft until it is saved. It does not reuse `rule`'s id:
+    /// saving it creates a rule, and the core mints the id. Nothing is sent
+    /// until then.
+    public func beginDuplicating(_ rule: Rule) {
+        editor = RuleEditorModel(duplicating: rule, session: session, chooser: chooser)
     }
 
     /// Closes the editor, discarding whatever was in it.
@@ -287,6 +406,7 @@ public final class RulesModel {
         // The core decides the order, and a new or re-prioritised rule may
         // have changed it.
         await load()
+        reveal(saved.id)
 
         return true
     }
@@ -329,6 +449,20 @@ public final class RulesModel {
     }
 
     // MARK: - Housekeeping
+
+    /// Makes a rule the list is not showing visible, so a save is not hidden
+    /// by the category or the search that was up while it was written.
+    private func reveal(_ id: String) {
+        guard let rule = rules.first(where: { $0.id == id }),
+            !visibleRules.contains(where: { $0.id == id })
+        else {
+            return
+        }
+
+        if !category.contains(rule) { category = .all }
+
+        searchText = ""
+    }
 
     /// Puts one changed rule back in the list where it already sits.
     ///

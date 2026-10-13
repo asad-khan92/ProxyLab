@@ -14,11 +14,19 @@ public enum TrafficDisplay {
     /// From the URL, falling back to the destination the proxy connected to,
     /// which is what an exchange rejected before it had a URL still has.
     public static func host(_ summary: ExchangeSummary) -> String {
-        if let host = URLComponents(string: summary.url)?.host, !host.isEmpty {
+        host(url: summary.url, destinationHost: summary.destination?.host)
+    }
+
+    /// The host a URL names, or the destination the proxy connected to.
+    ///
+    /// The same reading as ``host(_:)``. The detail pane has the exchange
+    /// rather than the list summary, and it should not grow a second parser.
+    public static func host(url: String, destinationHost: String?) -> String {
+        if let host = URLComponents(string: url)?.host, !host.isEmpty {
             return host
         }
 
-        return summary.destination?.host ?? "—"
+        return destinationHost ?? "—"
     }
 
     /// The host the core's own host filter compares, for one summary.

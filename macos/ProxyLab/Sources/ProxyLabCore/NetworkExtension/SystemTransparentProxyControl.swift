@@ -1,8 +1,11 @@
 //  The real thing: `SystemExtensions` to install the provider, and
 //  `NETransparentProxyManager` to switch it on and off.
 //
-//      Turn On ─▶ OSSystemExtensionRequest.activationRequest
+//      Turn On ─▶ an enabled extension at this build's version is already
+//                 installed: skip ahead to the configuration
+//                 otherwise OSSystemExtensionRequest.activationRequest
 //                   │   macOS may ask for approval in System Settings
+//                   │   a different version is replaced by that same request
 //                   ▼
 //                 NETransparentProxyManager.saveToPreferences
 //                   │   macOS may ask to allow proxy configurations
@@ -11,12 +14,12 @@
 //
 //      Turn Off ─▶ connection.stopVPNTunnel, and the configuration disabled
 //
-//  Nothing here runs by itself. Launching the app reads the state and changes
-//  nothing, so a ProxyLab that has just started is capturing only what is
-//  pointed at its explicit proxy, whatever was on when it was last quit. And
-//  quitting the app turns transparent capture off: a Mac whose every
-//  connection goes through a debugging proxy nobody can see is a Mac whose
-//  owner will not know why a pinned app has stopped working.
+//  Nothing here runs by itself. The app's capture lifecycle is what asks it
+//  to install and to switch the tunnel, and only after the bundled core is
+//  ready. Quitting turns the tunnel off and leaves the extension installed.
+//  The notification below is a backstop for that tunnel if termination did
+//  not already go through the lifecycle: it stops the tunnel and does not
+//  uninstall the extension.
 //
 //  The system's own proxy settings are never read or written here. A
 //  transparent proxy configuration is a Network Extension configuration of
@@ -42,8 +45,24 @@ public final class SystemTransparentProxyControl: TransparentProxyControl {
     /// What the configuration is called in System Settings.
     static let configurationName = "ProxyLab Transparent Capture"
 
+    /// How long the first activation callback is given.
+    ///
+    /// User approval is that callback returning `.awaitingApproval`. The time
+    /// the person then spends in System Settings is not this bound.
+    static let activationBound: Duration = .seconds(10)
+    /// How long a properties request is given before the state is unknown.
+    static let propertiesBound: Duration = .seconds(5)
+    /// How long saving or loading a configuration is given.
+    static let preferencesBound: Duration = .seconds(8)
+    /// How long a provider status message is given.
+    static let providerBound: Duration = .seconds(3)
+
     private let extensionIdentifier: String
+    private let extensionBundleURL: URL
     private var manager: NETransparentProxyManager?
+    /// Bumped to begin a Turn On and to abandon one. A Turn On keeps the
+    /// value from when it began.
+    private var turnGeneration: UInt64 = 0
     /// Requests still waiting on the system, kept so their delegates live
     /// until they are answered.
     private var requests: [ExtensionRequest] = []
@@ -56,6 +75,7 @@ public final class SystemTransparentProxyControl: TransparentProxyControl {
         let extensionURL = bundle.bundleURL
             .appendingPathComponent("Contents/Library/SystemExtensions", isDirectory: true)
             .appendingPathComponent("\(identifier).systemextension", isDirectory: true)
+        extensionBundleURL = extensionURL
         readiness = .evaluate(
             bundlePath: bundle.bundleURL.path,
             isAppBundle: bundle.bundleURL.pathExtension == "app",
@@ -80,15 +100,26 @@ public final class SystemTransparentProxyControl: TransparentProxyControl {
 
     public func snapshot() async -> TransparentProxySnapshot {
         guard readiness == .ready else {
-            return TransparentProxySnapshot(extensionState: .unknown, tunnel: .notConfigured)
+            return TransparentProxySnapshot(
+                extensionState: .unknown,
+                tunnel: .notConfigured,
+                requiresActivation: false
+            )
         }
 
-        let extensionState = await extensionProperties()
+        let observed = await extensionProperties()
         let manager = try? await loadManager()
+        let plan = ExtensionActivation.plan(
+            state: observed.state,
+            installed: observed.version,
+            bundled: bundledVersion(),
+            configurationSaved: manager != nil
+        )
 
         return TransparentProxySnapshot(
-            extensionState: extensionState,
-            tunnel: manager.map { Self.tunnelState($0) } ?? .notConfigured
+            extensionState: observed.state,
+            tunnel: manager.map { Self.tunnelState($0) } ?? .notConfigured,
+            requiresActivation: plan == .activate
         )
     }
 
@@ -97,13 +128,18 @@ public final class SystemTransparentProxyControl: TransparentProxyControl {
               session.status == .connected
         else { return nil }
 
+        let gate = CallbackGate<ProviderStatus?>()
         return await withCheckedContinuation { continuation in
             do {
                 try session.sendProviderMessage(ProviderMessage.status.encoded) { data in
-                    continuation.resume(returning: data.flatMap(ProviderStatus.decode))
+                    gate.finish(continuation, data.flatMap(ProviderStatus.decode))
                 }
             } catch {
-                continuation.resume(returning: nil)
+                gate.finish(continuation, nil)
+            }
+            Task { @MainActor in
+                try? await Task.sleep(for: Self.providerBound)
+                gate.finish(continuation, nil)
             }
         }
     }
@@ -130,11 +166,26 @@ public final class SystemTransparentProxyControl: TransparentProxyControl {
             requests.append(delegate)
             request.delegate = delegate
             OSSystemExtensionManager.shared.submitRequest(request)
+            Task { @MainActor in
+                try? await Task.sleep(for: Self.activationBound)
+                delegate.expireActivation(.failure(Self.timedOut))
+            }
         }
     }
 
-    public func turnOn(_ configuration: ProviderConfiguration) async throws {
+    public func beginTurnOn() -> UInt64 {
+        turnGeneration += 1
+        return turnGeneration
+    }
+
+    public func abandonInFlightWork() {
+        turnGeneration += 1
+    }
+
+    public func turnOn(_ configuration: ProviderConfiguration, generation: UInt64) async throws {
+        guard turnGeneration == generation else { return }
         let manager = try await loadManager() ?? NETransparentProxyManager()
+        guard turnGeneration == generation else { return }
 
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = extensionIdentifier
@@ -151,10 +202,22 @@ public final class SystemTransparentProxyControl: TransparentProxyControl {
         manager.isOnDemandEnabled = false
 
         do {
-            try await manager.saveToPreferences()
+            guard let saved = try await LifecycleBound.required(limit: Self.preferencesBound, {
+                try await manager.saveToPreferences()
+            }) else {
+                throw Self.timedOut
+            }
+            _ = saved
+            guard turnGeneration == generation else { return }
             // A saved configuration has to be read back before it can be
             // started — Apple's own requirement, not caution.
-            try await manager.loadFromPreferences()
+            guard let loaded = try await LifecycleBound.required(limit: Self.preferencesBound, {
+                try await manager.loadFromPreferences()
+            }) else {
+                throw Self.timedOut
+            }
+            _ = loaded
+            guard turnGeneration == generation else { return }
             try manager.connection.startVPNTunnel()
         } catch {
             throw TransparentProxyFailure.from(error)
@@ -170,7 +233,12 @@ public final class SystemTransparentProxyControl: TransparentProxyControl {
         manager.isEnabled = false
 
         do {
-            try await manager.saveToPreferences()
+            guard let saved = try await LifecycleBound.required(limit: Self.preferencesBound, {
+                try await manager.saveToPreferences()
+            }) else {
+                throw Self.timedOut
+            }
+            _ = saved
         } catch {
             throw TransparentProxyFailure.from(error)
         }
@@ -183,7 +251,11 @@ public final class SystemTransparentProxyControl: TransparentProxyControl {
     /// Picked out by the provider it names, so another app's transparent
     /// proxy on the same Mac is never read, changed, or switched off.
     private func loadManager() async throws -> NETransparentProxyManager? {
-        let all = try await NETransparentProxyManager.loadAllFromPreferences()
+        guard let all = try await LifecycleBound.required(limit: Self.preferencesBound, {
+            try await NETransparentProxyManager.loadAllFromPreferences()
+        }) else {
+            throw Self.timedOut
+        }
         let ours = all.first { manager in
             (manager.protocolConfiguration as? NETunnelProviderProtocol)?
                 .providerBundleIdentifier == extensionIdentifier
@@ -193,22 +265,37 @@ public final class SystemTransparentProxyControl: TransparentProxyControl {
         return ours
     }
 
-    private func extensionProperties() async -> ExtensionState {
+    /// The extension embedded in this app, when its bundle versions can be read.
+    private func bundledVersion() -> ExtensionVersion? {
+        guard let info = Bundle(url: extensionBundleURL)?.infoDictionary else { return nil }
+
+        return ExtensionVersion(info: info)
+    }
+
+    private func extensionProperties() async -> ObservedExtension {
         let request = OSSystemExtensionRequest.propertiesRequest(
             forExtensionWithIdentifier: extensionIdentifier,
             queue: .main
         )
 
         return await withCheckedContinuation { continuation in
-            let delegate = ExtensionRequest(properties: { state in
-                continuation.resume(returning: state)
+            let delegate = ExtensionRequest(properties: { observed in
+                continuation.resume(returning: observed)
             })
             requests.removeAll(where: \.isAnswered)
             requests.append(delegate)
             request.delegate = delegate
             OSSystemExtensionManager.shared.submitRequest(request)
+            Task { @MainActor in
+                try? await Task.sleep(for: Self.propertiesBound)
+                delegate.expireProperties(ObservedExtension(state: .unknown, version: nil))
+            }
         }
     }
+
+    private static let timedOut = TransparentProxyFailure(
+        message: "macOS did not answer in time. Try again."
+    )
 
     /// Quitting ProxyLab turns transparent capture off. See the file header.
     private func stopForTermination() {
@@ -242,14 +329,24 @@ public final class SystemTransparentProxyControl: TransparentProxyControl {
     }
 }
 
+/// What a properties request said, including the version macOS has installed.
+private struct ObservedExtension: Equatable {
+    var state: ExtensionState
+    var version: ExtensionVersion?
+}
+
 /// One request's delegate, turning the framework's callbacks into a result.
 ///
 /// Every callback is delivered on the main queue — the queue each request
 /// is made with — so everything here is main-actor state.
 private final class ExtensionRequest: NSObject, OSSystemExtensionRequestDelegate, @unchecked Sendable {
     private var activation: (@MainActor (Result<ActivationOutcome, Error>) -> Void)?
-    private var properties: (@MainActor (ExtensionState) -> Void)?
+    private var properties: (@MainActor (ObservedExtension) -> Void)?
     private let finishedLater: (@MainActor () -> Void)?
+    /// Set when this request was asked to replace an extension at the same
+    /// version and declined. The cancellation that follows means the
+    /// installed copy stays.
+    private var keptInstalled = false
 
     init(
         activation: @escaping @MainActor (Result<ActivationOutcome, Error>) -> Void,
@@ -260,7 +357,7 @@ private final class ExtensionRequest: NSObject, OSSystemExtensionRequestDelegate
         self.finishedLater = finishedLater
     }
 
-    init(properties: @escaping @MainActor (ExtensionState) -> Void) {
+    init(properties: @escaping @MainActor (ObservedExtension) -> Void) {
         self.activation = nil
         self.properties = properties
         self.finishedLater = nil
@@ -271,9 +368,30 @@ private final class ExtensionRequest: NSObject, OSSystemExtensionRequestDelegate
         actionForReplacingExtension existing: OSSystemExtensionProperties,
         withExtension ext: OSSystemExtensionProperties
     ) -> OSSystemExtensionRequest.ReplacementAction {
-        // A rebuilt ProxyLab carries a rebuilt provider, and the one it
-        // carries is the one that matches it.
-        .replace
+        let decision = ExtensionActivation.replacement(
+            existing: ExtensionVersion(
+                shortVersion: existing.bundleShortVersion,
+                bundleVersion: existing.bundleVersion
+            ),
+            proposed: ExtensionVersion(
+                shortVersion: ext.bundleShortVersion,
+                bundleVersion: ext.bundleVersion
+            )
+        )
+
+        switch decision {
+        case .replace:
+            // A different version. The request macOS already has continues,
+            // and macOS still validates the replacement.
+            return .replace
+        case .keepInstalled:
+            // Same version. Asking macOS to replace it fails validation,
+            // which is a different error from a rejected signature. The
+            // installed extension stays, and the cancellation is completed
+            // as "already installed" so the configuration can start.
+            keptInstalled = true
+            return .cancel
+        }
     }
 
     func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
@@ -295,7 +413,7 @@ private final class ExtensionRequest: NSObject, OSSystemExtensionRequestDelegate
             }
             if let properties {
                 self.properties = nil
-                properties(.notInstalled)
+                properties(ObservedExtension(state: .notInstalled, version: nil))
                 return
             }
             finishedLater?()
@@ -304,10 +422,17 @@ private final class ExtensionRequest: NSObject, OSSystemExtensionRequestDelegate
 
     func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) {
         MainActor.assumeIsolated {
+            let nsError = error as NSError
+            if keptInstalled,
+               ExtensionActivation.useInstalledAfterCancellation(domain: nsError.domain, code: nsError.code),
+               answerActivation(.success(.installed))
+            {
+                return
+            }
             if answerActivation(.failure(TransparentProxyFailure.from(error))) { return }
             if let properties {
                 self.properties = nil
-                properties(.unknown)
+                properties(ObservedExtension(state: .unknown, version: nil))
             }
         }
     }
@@ -318,20 +443,41 @@ private final class ExtensionRequest: NSObject, OSSystemExtensionRequestDelegate
     ) {
         // Read here, on the queue the framework called on, so what crosses
         // to the main actor is a value and not the framework's objects.
-        let state: ExtensionState
-        if found.contains(where: { $0.isEnabled && !$0.isUninstalling }) {
-            state = .installed
-        } else if found.contains(where: \.isAwaitingUserApproval) {
-            state = .awaitingApproval
+        let observed: ObservedExtension
+        if let enabled = found.first(where: { $0.isEnabled && !$0.isUninstalling }) {
+            observed = ObservedExtension(state: .installed, version: Self.version(enabled))
+        } else if let waiting = found.first(where: \.isAwaitingUserApproval) {
+            observed = ObservedExtension(state: .awaitingApproval, version: Self.version(waiting))
         } else {
-            state = .notInstalled
+            observed = ObservedExtension(state: .notInstalled, version: nil)
         }
 
         MainActor.assumeIsolated {
             guard let properties else { return }
             self.properties = nil
-            properties(state)
+            properties(observed)
         }
+    }
+
+    private static func version(_ properties: OSSystemExtensionProperties) -> ExtensionVersion {
+        ExtensionVersion(
+            shortVersion: properties.bundleShortVersion,
+            bundleVersion: properties.bundleVersion
+        )
+    }
+
+    /// The activation bound passed. A callback that already answered is left alone.
+    @MainActor
+    func expireActivation(_ result: Result<ActivationOutcome, Error>) {
+        _ = answerActivation(result)
+    }
+
+    /// The properties bound passed. A callback that already answered is left alone.
+    @MainActor
+    func expireProperties(_ observed: ObservedExtension) {
+        guard let properties else { return }
+        self.properties = nil
+        properties(observed)
     }
 
     /// Whether nothing more is waiting on this request.

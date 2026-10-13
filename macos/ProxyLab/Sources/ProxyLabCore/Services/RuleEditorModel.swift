@@ -89,7 +89,10 @@ public let commonHTTPMethods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD",
 @Observable
 public final class RuleEditorModel {
     /// What is being edited.
-    public let mode: RuleEditorMode
+    ///
+    /// A duplicate starts from an existing rule and then becomes a create, so
+    /// this is set once the fields have been copied and not only in `init`.
+    public private(set) var mode: RuleEditorMode
 
     // MARK: - The draft
 
@@ -141,16 +144,22 @@ public final class RuleEditorModel {
     public private(set) var saveState: RuleSaveState = .editing
 
     /// The rule as it was loaded, for an edit: what a change is measured
-    /// against, so only what differs is sent.
-    private let original: Rule?
+    /// against, so only what differs is sent. A duplicate clears this, because
+    /// the draft is a new rule and not a change to the one it was copied from.
+    private var original: Rule?
+
+    /// A title that is not "New Rule" or "Edit Rule". Set for a duplicate.
+    private var titleOverride: String? = nil
 
     private let session: any RulesSession
     private let chooser: any LocalFileChooser
     private let fileManager: FileManager
 
-    /// A new rule, with `kind` chosen and nothing else filled in.
+    /// A new rule, with `kind` chosen and, when `seed` is set, the fields a
+    /// captured exchange can fill in for that kind.
     public init(
         creating kind: RuleActionKind,
+        seed: RuleDraftSeed? = nil,
         session: any RulesSession,
         chooser: any LocalFileChooser,
         fileManager: FileManager = .default
@@ -178,6 +187,41 @@ public final class RuleEditorModel {
         redirectStatus = RedirectAction.defaultStatus
         modifyRequest = ModifyRequestDraft()
         modifyResponse = ModifyResponseDraft()
+
+        if let seed { apply(seed) }
+    }
+
+    /// A new rule whose fields are copied from `rule`.
+    ///
+    /// The id is not copied. Saving sends `create_rule`, and the core mints a
+    /// new one. The name gains " Copy". The priority is the source's, so the
+    /// newer id sorts the copy just after it when the priorities are equal.
+    /// Nothing transient — a refusal, a save in flight — is copied, because
+    /// those belong to the editor session and not to the rule.
+    public convenience init(
+        duplicating rule: Rule,
+        session: any RulesSession,
+        chooser: any LocalFileChooser,
+        fileManager: FileManager = .default
+    ) {
+        self.init(editing: rule, session: session, chooser: chooser, fileManager: fileManager)
+        mode = .create
+        original = nil
+        name = Self.duplicateName(for: rule.name)
+        titleOverride = "Duplicate Rule"
+    }
+
+    /// "`name` Copy", shortened so it still fits in the name the core allows.
+    static func duplicateName(for name: String) -> String {
+        let suffix = " Copy"
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let combined = trimmed + suffix
+        guard combined.count > maxRuleNameLength else { return combined }
+
+        let keep = max(0, maxRuleNameLength - suffix.count)
+        let head = String(trimmed.prefix(keep)).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return head + suffix
     }
 
     /// An existing rule, with every field as the core holds it.
@@ -236,11 +280,31 @@ public final class RuleEditorModel {
         }
     }
 
+    /// Copies a draft started from a captured exchange into the fields.
+    ///
+    /// The file a Map Local rule answers with is not among them: the exchange
+    /// does not name a file, and the person still chooses one.
+    private func apply(_ seed: RuleDraftSeed) {
+        if !seed.name.isEmpty { name = seed.name }
+        host = seed.host
+        path = seed.path
+        pathIsPrefix = false
+        method = seed.method
+        if let status = seed.localStatus { localStatus = status }
+        if let type = seed.localContentType { localContentType = type }
+        if let destination = seed.destination { self.destination = destination }
+        if let redirectURL = seed.redirectURL { self.redirectURL = redirectURL }
+        modifyRequest = seed.modifyRequest
+        modifyResponse = seed.modifyResponse
+    }
+
     // MARK: - What the editor shows
 
     /// The title of the window the editor is in.
     public var title: String {
-        mode.isCreate ? "New Rule" : "Edit Rule"
+        if let titleOverride { return titleOverride }
+
+        return mode.isCreate ? "New Rule" : "Edit Rule"
     }
 
     /// What the save button says.

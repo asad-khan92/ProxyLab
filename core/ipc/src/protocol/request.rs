@@ -165,6 +165,11 @@ pub enum Operation {
     /// what makes the proxy pause at all — see
     /// [`PauseStream`](crate::breakpoint::PauseStream).
     WatchBreakpoints,
+    /// Where the proxy process stands, and the recent problems it has kept.
+    ///
+    /// Not a traffic operation: it reads the listeners, the LAN control, and
+    /// an in-memory buffer. It does not read a captured exchange.
+    Diagnostics,
 }
 
 /// A request about the requests somebody has kept.
@@ -1006,6 +1011,10 @@ fn operation(
         "subscribe" => {
             no_parameters(id, parameters)?;
             Ok(Operation::Subscribe)
+        }
+        "diagnostics" => {
+            no_parameters(id, parameters)?;
+            Ok(Operation::Diagnostics)
         }
         _ => Err(ParseFailure::of(
             id,

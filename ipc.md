@@ -92,6 +92,14 @@ in the same way. Sending one is not among them: a client reads a saved
 request and asks for it through `replay_request`, which is the one replay
 path there is. See **Saved requests** above.
 
+`diagnostics` is additive on the same version-1 protocol and takes no
+parameters. The answer is the core version, whether the process is running,
+the loopback listener, the transparent bridge, LAN exposure when this server
+manages it (the same status `lan_status` returns), storage, IPC, and a
+bounded in-memory list of recent warnings and errors. It does not read
+captured traffic. Messages are sanitized again on the way out: no bodies,
+credentials, query strings, or personal paths.
+
 The HAR operations are `export_har` and `import_har`, and they are the one
 pair that names a *file*: a HAR document does not fit in a 64 KiB request
 line in either direction, so the client sends the path a person picked in a

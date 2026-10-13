@@ -79,6 +79,7 @@
 //! for free.
 
 pub mod breakpoint;
+pub mod diagnostics;
 pub mod error;
 pub mod lan;
 pub mod protocol;
@@ -95,6 +96,10 @@ pub use breakpoint::{
     BreakpointUpdate, NewBreakpoint, PauseDecision, PauseId, PauseNotice, PauseStream,
     PausedExchange, PausedRequest, PausedResponse, PausedWebSocketMessage, ReleaseReason,
     RequestEdit, ResponseEdit, WebSocketEdit, MAX_BREAKPOINT_BODY_BYTES,
+};
+pub use diagnostics::{
+    ComponentStatus, DiagnosticEvent, DiagnosticsControl, DiagnosticsFacts, DiagnosticsReport,
+    EndpointStatus, OPEN,
 };
 pub use error::IpcError;
 pub use lan::{LanAddress, LanControl, LanFuture, LanRefusal, LanStatus};

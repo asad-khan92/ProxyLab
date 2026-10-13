@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use proxy_http::RequestSpec;
 use proxy_ipc::{
-    Breakpoint, BreakpointControl, BreakpointId, BreakpointUpdate, IpcConfig, IpcServer,
-    NewBreakpoint, PauseDecision, PauseId, PauseNotice, PausedExchange, ReleaseReason,
+    Breakpoint, BreakpointControl, BreakpointId, BreakpointUpdate, DiagnosticsControl, IpcConfig,
+    IpcServer, NewBreakpoint, PauseDecision, PauseId, PauseNotice, PausedExchange, ReleaseReason,
     ReplayFuture, ReplayOutcome, RequestReplayer, ThrottleControl, ThrottleSettings,
     TrafficService,
 };
@@ -81,6 +81,7 @@ impl TestServer {
             None,
             Some(Arc::new(breakpoints.clone())),
             Some(Arc::new(throttle.clone())),
+            None,
         )
         .await;
 
@@ -123,10 +124,33 @@ impl TestServer {
         streams: StreamPublisher,
         replayer: Option<Arc<dyn RequestReplayer>>,
     ) -> Self {
-        Self::wired(directory, storage, publisher, streams, replayer, None, None).await
+        Self::wired(
+            directory, storage, publisher, streams, replayer, None, None, None,
+        )
+        .await
+    }
+
+    /// Starts a server that reports `control` when asked for diagnostics.
+    pub async fn diagnosing(control: Arc<dyn DiagnosticsControl>) -> Self {
+        let directory = TempDir::new().expect("a temporary directory");
+        let storage =
+            Storage::open(StorageConfig::in_directory(directory.path())).expect("a store opens");
+
+        Self::wired(
+            directory,
+            storage,
+            EventPublisher::new(),
+            StreamPublisher::new(),
+            None,
+            None,
+            None,
+            Some(control),
+        )
+        .await
     }
 
     /// The same again, with whichever of the boundaries the test wants served.
+    #[allow(clippy::too_many_arguments)]
     async fn wired(
         directory: TempDir,
         storage: Storage,
@@ -135,6 +159,7 @@ impl TestServer {
         replayer: Option<Arc<dyn RequestReplayer>>,
         breakpoints: Option<Arc<dyn BreakpointControl>>,
         throttle: Option<Arc<dyn ThrottleControl>>,
+        diagnostics: Option<Arc<dyn DiagnosticsControl>>,
     ) -> Self {
         let socket = directory.path().join("proxylab.sock");
         let server = IpcServer::bind(&IpcConfig::at(&socket)).expect("the server binds");
@@ -155,6 +180,9 @@ impl TestServer {
         }
         if let Some(throttle) = throttle {
             service = service.throttling_with(throttle);
+        }
+        if let Some(diagnostics) = diagnostics {
+            service = service.reporting(diagnostics);
         }
         let (shutdown, signal) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -427,6 +455,8 @@ pub struct RecordingReplayer {
 struct ReplayLog {
     requests: Vec<RequestSpec>,
     answer: Answer,
+    /// When set, the next replay waits until this is sent or dropped.
+    hold: Option<oneshot::Receiver<()>>,
 }
 
 /// What the next replay comes back as.
@@ -443,6 +473,7 @@ impl Default for ReplayLog {
         Self {
             requests: Vec::new(),
             answer: Answer::Status(200),
+            hold: None,
         }
     }
 }
@@ -476,6 +507,18 @@ impl RecordingReplayer {
         self.locked().answer = Answer::Failure(TrafficError::of(kind));
     }
 
+    /// Holds the next replay until the returned sender is used.
+    ///
+    /// What a shutdown test uses to prove the server does not wait for a
+    /// destination that has not answered. Dropping the sender releases the
+    /// replay the same way a destination that closed would.
+    pub fn pause_next(&self) -> oneshot::Sender<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.locked().hold = Some(receiver);
+
+        sender
+    }
+
     fn locked(&self) -> std::sync::MutexGuard<'_, ReplayLog> {
         self.log.lock().expect("the log is readable")
     }
@@ -483,19 +526,28 @@ impl RecordingReplayer {
 
 impl RequestReplayer for RecordingReplayer {
     fn replay(&self, request: RequestSpec) -> ReplayFuture<'_> {
-        let outcome = {
+        let (outcome, hold) = {
             let mut log = self.locked();
             log.requests.push(request);
+            let hold = log.hold.take();
 
             // A new id every time, as the engine mints one every time.
             let id = ExchangeId::next();
-            match &log.answer {
+            let outcome = match &log.answer {
                 Answer::Status(status) => ReplayOutcome::answered(id, *status),
                 Answer::Failure(error) => ReplayOutcome::failed(id, error.clone()),
-            }
+            };
+
+            (outcome, hold)
         };
 
-        Box::pin(async move { outcome })
+        Box::pin(async move {
+            if let Some(hold) = hold {
+                let _ = hold.await;
+            }
+
+            outcome
+        })
     }
 }
 

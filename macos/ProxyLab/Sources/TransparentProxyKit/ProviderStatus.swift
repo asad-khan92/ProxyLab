@@ -22,18 +22,61 @@ public struct ProviderStatus: Codable, Equatable, Sendable {
     }
 
     /// How many flows went where, since the provider started.
+    ///
+    /// `bridged`, `passedThrough`, and `proxyLab` are the running account:
+    /// a flow that was handed over and then given back is taken out of
+    /// `bridged`. The `claimed` and `bypassed` fields only increase, so a
+    /// later look can still tell a TCP :443 claim from a QUIC bypass.
     public struct Counters: Codable, Equatable, Sendable {
-        /// Handed to the core.
+        /// Handed to the core and not since given back.
         public var bridged = 0
         /// Carried directly because the core was not there.
         public var passedThrough = 0
         /// The core's own connections, left to macOS.
         public var proxyLab = 0
+        /// TCP port 80 flows handed to the core.
+        public var claimedTcp80 = 0
+        /// TCP port 443 flows handed to the core.
+        public var claimedTcp443 = 0
+        /// TCP to a port other than 80 or 443. The network rules do not
+        /// deliver these, so this stays zero unless one arrives anyway.
+        public var bypassedPort = 0
+        /// UDP, including QUIC on port 443, left to macOS.
+        public var bypassedUdp = 0
+        /// Loopback, left to macOS.
+        public var bypassedLoopback = 0
+        /// The core's own process, left to macOS.
+        public var bypassedProxyLab = 0
+        /// A claimed flow the bridge did not keep, then carried directly,
+        /// and the flows left alone while that lasted.
+        public var bridgeFallback = 0
+        /// A flow whose destination could not be read.
+        public var bypassedUnreadable = 0
 
-        public init(bridged: Int = 0, passedThrough: Int = 0, proxyLab: Int = 0) {
+        public init(
+            bridged: Int = 0,
+            passedThrough: Int = 0,
+            proxyLab: Int = 0,
+            claimedTcp80: Int = 0,
+            claimedTcp443: Int = 0,
+            bypassedPort: Int = 0,
+            bypassedUdp: Int = 0,
+            bypassedLoopback: Int = 0,
+            bypassedProxyLab: Int = 0,
+            bridgeFallback: Int = 0,
+            bypassedUnreadable: Int = 0
+        ) {
             self.bridged = bridged
             self.passedThrough = passedThrough
             self.proxyLab = proxyLab
+            self.claimedTcp80 = claimedTcp80
+            self.claimedTcp443 = claimedTcp443
+            self.bypassedPort = bypassedPort
+            self.bypassedUdp = bypassedUdp
+            self.bypassedLoopback = bypassedLoopback
+            self.bypassedProxyLab = bypassedProxyLab
+            self.bridgeFallback = bridgeFallback
+            self.bypassedUnreadable = bypassedUnreadable
         }
     }
 

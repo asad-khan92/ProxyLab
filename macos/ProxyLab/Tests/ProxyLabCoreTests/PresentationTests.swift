@@ -123,13 +123,26 @@ struct TrafficDisplayTests {
         // A body longer than the signed count Foundation formats is clamped
         // rather than trapped on.
         #expect(!TrafficDisplay.size(UInt64.max).isEmpty)
+        // One formatter, the platform's byte count: bytes, then kilobytes,
+        // then megabytes. The row does not keep a second one.
+        #expect(TrafficDisplay.size(512) == Int64(512).formatted(.byteCount(style: .binary)))
+        #expect(TrafficDisplay.size(2_048) == Int64(2_048).formatted(.byteCount(style: .binary)))
+        #expect(
+            TrafficDisplay.size(2_097_152) == Int64(2_097_152).formatted(.byteCount(style: .binary))
+        )
+        #expect(TrafficDisplay.size(512).localizedCaseInsensitiveContains("byte"))
+        #expect(TrafficDisplay.size(2_048).localizedCaseInsensitiveContains("kb"))
+        #expect(TrafficDisplay.size(2_097_152).localizedCaseInsensitiveContains("mb"))
     }
 
     @Test("a duration is shown at a scale a person reads")
     func durations() {
         #expect(TrafficDisplay.duration(milliseconds: nil) == nil)
+        #expect(TrafficDisplay.duration(milliseconds: 0) == "0.00 ms")
         #expect(TrafficDisplay.duration(milliseconds: 0.25) == "0.25 ms")
         #expect(TrafficDisplay.duration(milliseconds: 84) == "84 ms")
+        #expect(TrafficDisplay.duration(milliseconds: 999) == "999 ms")
+        #expect(TrafficDisplay.duration(milliseconds: 1_000) == "1.00 s")
         #expect(TrafficDisplay.duration(milliseconds: 1_500) == "1.50 s")
     }
 

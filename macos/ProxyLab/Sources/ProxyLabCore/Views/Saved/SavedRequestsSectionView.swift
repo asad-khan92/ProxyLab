@@ -60,7 +60,7 @@ struct SavedRequestsSectionView: View {
             isPresented: deleteBinding,
             presenting: confirmingDelete
         ) { request in
-            Button("Delete", role: .destructive) {
+            Button("Delete Saved Request", role: .destructive) {
                 Task { await model.delete(request.id) }
             }
             Button("Cancel", role: .cancel) {}
@@ -109,12 +109,22 @@ struct SavedRequestsSectionView: View {
         case .loading where model.isEmpty:
             note("Loading…")
         case let .failed(reason):
-            Text(reason)
+            Text(UserFacingNotice(reason).summary)
                 .font(.system(size: 10))
-                .foregroundStyle(.red)
+                .foregroundStyle(StatusTone.fault.color)
                 .fixedSize(horizontal: false, vertical: true)
+                .help(UserFacingNotice(reason).detail ?? reason)
         case .loaded where model.isEmpty:
-            note("Nothing saved yet. Select a request and choose Save Request.")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(SavedEmptyCopy.title)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text(SavedEmptyCopy.detail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
         default:
             rows
         }
@@ -145,7 +155,7 @@ struct SavedRequestsSectionView: View {
                 renameText = request.name
                 model.beginRename(request)
             }
-            Button("Delete…", role: .destructive) { confirmingDelete = request }
+            Button("Delete Saved Request…", role: .destructive) { confirmingDelete = request }
         }
     }
 

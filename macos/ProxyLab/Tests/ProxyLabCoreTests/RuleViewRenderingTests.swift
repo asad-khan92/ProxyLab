@@ -240,6 +240,87 @@ struct RuleViewRenderingTests {
         }
     }
 
+    @Test("the rule chooser draws")
+    func chooserDraws() async throws {
+        let model = await model([
+            RuleFixtures.rule(id: "local", name: "mock the config", action: .mapLocal(
+                MapLocalAction(path: "/tmp/config.json")
+            ))
+        ])
+        let summary = ExchangeSummary(
+            id: "row",
+            startedAt: Timestamp(seconds: 1_700_000_000, nanos: 0),
+            client: "127.0.0.1:1",
+            scheme: .https,
+            destination: Destination(host: "api.example.com", port: 443),
+            method: "GET",
+            url: "https://api.example.com/config",
+            version: .http11,
+            completed: true
+        )
+        let sheet = RuleChooserSheet(
+            model: model,
+            request: TrafficRuleRequest(
+                kind: .mapLocal,
+                exchangeID: summary.id,
+                seed: RuleDraftSeed.from(summary: summary, kind: .mapLocal)
+            )
+        ) { _ in nil }
+
+        let size = try #require(rendered(sheet.frame(height: 440), width: 480))
+        #expect(size.width > 0)
+        #expect(size.height > 0)
+    }
+
+    @Test("the rules screen draws at a wide width and a narrow one")
+    func screenDrawsWideAndNarrow() async throws {
+        let model = await model(RuleFixtures.ordered())
+        model.selectedID = model.rules[0].id
+
+        let wide = try #require(
+            rendered(RulesView(model: model, section: .constant(.rules)).frame(height: 640), width: 980)
+        )
+        let narrow = try #require(
+            rendered(RulesView(model: model, section: .constant(.rules)).frame(height: 640), width: 420)
+        )
+
+        #expect(wide.width > 0 && wide.height > 0)
+        #expect(narrow.width > 0 && narrow.height > 0)
+    }
+
+    @Test("empty rules, an empty category, and a missed search each draw")
+    func emptyScreensDraw() async throws {
+        let session = FakeRulesSession()
+        await session.answerList(with: [])
+        let empty = RulesModel(session: session, chooser: FakeFileChooser())
+        await empty.load()
+
+        #expect(rendered(RulesView(model: empty, section: .constant(.rules)).frame(height: 480), width: 900) != nil)
+
+        let model = await model(RuleFixtures.ordered())
+        model.category = .redirect
+        #expect(model.placeholder == .emptyCategory("No Redirect rules"))
+        #expect(rendered(RulesView(model: model, section: .constant(.rules)).frame(height: 480), width: 900) != nil)
+
+        model.category = .all
+        model.searchText = "nothing-matches"
+        #expect(model.placeholder == .noMatches)
+        #expect(rendered(RulesView(model: model, section: .constant(.rules)).frame(height: 480), width: 900) != nil)
+    }
+
+    @Test("the editor fills a narrow detail pane")
+    func editorDrawsInThePane() async throws {
+        let model = await model(RuleFixtures.ordered())
+        model.beginEditing(model.rules[0])
+        let editor = try #require(model.editor)
+        let size = try #require(
+            rendered(RuleEditorView(editor: editor, model: model, placement: .pane), width: 360)
+        )
+
+        #expect(size.width > 0 && size.height > 0)
+        #expect(size.width < 520)
+    }
+
     @Test("the section control draws for either section")
     func sectionPickerDraws() {
         for section in AppSection.allCases {

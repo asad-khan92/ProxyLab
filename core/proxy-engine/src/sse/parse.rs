@@ -8,8 +8,8 @@
 //! The grammar is WHATWG's: fields named `event`, `data`, `id`, and `retry`,
 //! events separated by a blank line. A field this parser does not know is
 //! ignored rather than fatal. An incomplete event at the end of the stream
-//! is dropped — that is the spec, and it is also what keeps a stream that
-//! never ends from leaving an unbounded buffer behind.
+//! is dropped — that is the spec. A line that never ends is discarded past
+//! the capture limit, so one endless line cannot grow the buffer with it.
 
 /// One dispatched event, as the inspector shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +28,19 @@ pub struct SseEvent {
     pub truncated: bool,
 }
 
+/// How many extra bytes of a line are kept beyond the capture limit.
+///
+/// The field prefix (`data: `) has to fit in front of the captured value.
+/// Anything past the ceiling is counted, when it is data, and not stored.
+const LINE_SLACK: usize = 64;
+
+/// The most of an SSE `event` or `id` field that is kept.
+///
+/// Those fields travel on the summary, which is sent for every event. A
+/// multi-megabyte name would be a summary that is not one. Ordinary names
+/// are a few characters and are kept whole.
+const MAX_FIELD_TEXT: usize = 8 * 1024;
+
 /// Accumulates bytes and emits events as blank lines arrive.
 pub struct SseParser {
     buffer: Vec<u8>,
@@ -39,6 +52,12 @@ pub struct SseParser {
     truncated: bool,
     skipping: bool,
     saw_bom: bool,
+    /// The rest of a line that already hit the ceiling, until its ending.
+    discarding: bool,
+    /// The discarded bytes belong to a `data` field and count toward its size.
+    discard_as_data: bool,
+    /// The discarded line ended on a bare `\r` and the next byte may be `\n`.
+    discard_saw_cr: bool,
     limit: usize,
 }
 
@@ -55,8 +74,22 @@ impl SseParser {
             truncated: false,
             skipping: false,
             saw_bom: false,
+            discarding: false,
+            discard_as_data: false,
+            discard_saw_cr: false,
             limit,
         }
+    }
+
+    /// How many bytes of an unfinished line are currently retained.
+    #[cfg(test)]
+    fn retained(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// The most of one unfinished line this parser will retain.
+    fn line_ceiling(&self) -> usize {
+        self.limit.saturating_add(LINE_SLACK).max(LINE_SLACK)
     }
 
     /// Consumes `bytes` and returns every event that completed in them.
@@ -69,16 +102,114 @@ impl SseParser {
             self.saw_bom = true;
         }
 
-        self.buffer.extend_from_slice(input);
-
         let mut events = Vec::new();
+        self.absorb(input, &mut events);
+        events
+    }
+
+    /// Takes `input` into the line buffer, or discards it once the line is
+    /// already longer than the capture is allowed to remember.
+    fn absorb(&mut self, mut input: &[u8], events: &mut Vec<SseEvent>) {
+        loop {
+            if self.discard_saw_cr {
+                self.discard_saw_cr = false;
+                if input.first() == Some(&b'\n') {
+                    input = &input[1..];
+                }
+                self.discarding = false;
+                self.discard_as_data = false;
+            }
+
+            if self.discarding {
+                if input.is_empty() {
+                    return;
+                }
+                match input
+                    .iter()
+                    .position(|byte| *byte == b'\n' || *byte == b'\r')
+                {
+                    Some(index) => {
+                        self.note_discarded(&input[..index]);
+                        if input[index] == b'\r' && index + 1 == input.len() {
+                            self.discard_saw_cr = true;
+                            return;
+                        }
+                        let skip = 1 + usize::from(
+                            input[index] == b'\r' && input.get(index + 1) == Some(&b'\n'),
+                        );
+                        input = &input[index + skip..];
+                        self.discarding = false;
+                        self.discard_as_data = false;
+                    }
+                    None => {
+                        self.note_discarded(input);
+                        return;
+                    }
+                }
+                continue;
+            }
+
+            self.drain_lines(events);
+            if self.buffer.len() >= self.line_ceiling() {
+                self.begin_discard();
+                continue;
+            }
+            if input.is_empty() {
+                return;
+            }
+
+            let room = self.line_ceiling() - self.buffer.len();
+            let take = room.min(input.len());
+            self.buffer.extend_from_slice(&input[..take]);
+            input = &input[take..];
+        }
+    }
+
+    fn drain_lines(&mut self, events: &mut Vec<SseEvent>) {
         while let Some(line) = next_line(&mut self.buffer) {
             if let Some(event) = self.consume_line(&line) {
                 events.push(event);
             }
         }
+    }
 
-        events
+    /// The buffer is one line that has already hit the ceiling. Keep the
+    /// prefix, and discard until the line actually ends.
+    fn begin_discard(&mut self) {
+        let line = std::mem::take(&mut self.buffer);
+        self.discarding = true;
+        if self.skipping {
+            return;
+        }
+
+        let (name, value) = split_field(&line);
+        match name {
+            b"data" => {
+                self.push_data(value);
+                self.discard_as_data = true;
+                self.truncated = true;
+            }
+            b"event" => self.event_name = Some(bounded_field(value)),
+            b"id" => {
+                if !value.contains(&b'\0') {
+                    self.event_id = Some(bounded_field(value));
+                }
+            }
+            b"retry" => {
+                if let Ok(text) = std::str::from_utf8(value) {
+                    if text.bytes().all(|byte| byte.is_ascii_digit()) {
+                        self.retry_ms = text.parse().ok();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn note_discarded(&mut self, bytes: &[u8]) {
+        if self.discard_as_data {
+            self.data_size += bytes.len() as u64;
+        }
     }
 
     /// Ends the stream. An event that never saw a blank line is dropped.
@@ -106,10 +237,10 @@ impl SseParser {
 
         let (name, value) = split_field(line);
         match name {
-            b"event" => self.event_name = Some(field_text(value)),
+            b"event" => self.event_name = Some(bounded_field(value)),
             b"id" => {
                 if !value.contains(&b'\0') {
-                    self.event_id = Some(field_text(value));
+                    self.event_id = Some(bounded_field(value));
                 }
             }
             b"retry" => {
@@ -218,6 +349,20 @@ fn field_text(value: &[u8]) -> String {
     String::from_utf8_lossy(value).into_owned()
 }
 
+/// `value` as text, cut at [`MAX_FIELD_TEXT`] on a character boundary.
+fn bounded_field(value: &[u8]) -> String {
+    let text = field_text(value);
+    if text.len() <= MAX_FIELD_TEXT {
+        return text;
+    }
+
+    let mut end = MAX_FIELD_TEXT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +451,29 @@ mod tests {
     fn a_retry_that_is_not_a_number_is_ignored() {
         let events = parse(1_024, &[b"retry: soon\ndata: x\n\n"]);
         assert_eq!(events[0].retry_ms, None);
+    }
+
+    #[test]
+    fn a_line_without_an_ending_does_not_grow_without_limit() {
+        let mut parser = SseParser::new(8);
+        let mut huge = b"data: ".to_vec();
+        huge.extend(std::iter::repeat_n(b'x', 2_000_000));
+
+        assert!(parser.push(&huge).is_empty());
+        assert!(
+            parser.retained() <= parser.line_ceiling(),
+            "retained {} bytes of a line with no ending",
+            parser.retained()
+        );
+
+        let events = parser.push(b"\n\ndata: ok\n\n");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data, b"xxxxxxxx");
+        assert_eq!(events[0].size, 2_000_000);
+        assert!(events[0].truncated);
+        assert_eq!(events[1].data, b"ok");
+        assert!(!events[1].truncated);
+        assert!(parser.retained() <= parser.line_ceiling());
     }
 }

@@ -48,7 +48,7 @@ struct StreamMessagesView: View {
             .fixedSize(horizontal: false, vertical: true)
         } else {
             VStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(model.streamMessages.enumerated()), id: \.element.id) { index, message in
+                ForEach(model.streamMessages) { message in
                     StreamMessageRow(
                         message: message,
                         selected: message.id == model.selectedStreamID
@@ -58,9 +58,12 @@ struct StreamMessagesView: View {
                         Task { await model.selectStream(message.id) }
                     }
                     .onAppear {
-                        if model.shouldLoadMoreStreams(atRow: index) {
-                            Task { await model.loadMoreStreams() }
-                        }
+                        guard
+                            let index = model.streamMessages.firstIndex(where: { $0.id == message.id }),
+                            model.shouldLoadMoreStreams(atRow: index)
+                        else { return }
+
+                        Task { await model.loadMoreStreams() }
                     }
                 }
             }
@@ -153,15 +156,11 @@ private struct StreamPayloadView: View {
         }
 
         DetailSection(title: "Payload") {
-            if !inspection.isEmpty {
-                CopyButton(what: copyDescription) {
-                    model.copySelectedStreamPayload()
-                }
-            }
-        } content: {
-            BodyView(inspection: inspection) { text, what in
-                model.copy(text, as: what)
-            }
+            BodyView(
+                inspection: inspection,
+                copySubject: "the payload",
+                copy: { text, what in model.copy(text, as: what) }
+            )
         }
     }
 
@@ -197,12 +196,5 @@ private struct StreamPayloadView: View {
         }
 
         return fields
-    }
-
-    private var copyDescription: String {
-        switch inspection.content {
-        case .image, .binary, .undecodable: "the payload as Base64"
-        case .empty, .text: "the payload"
-        }
     }
 }

@@ -35,8 +35,11 @@ managed with **`NETransparentProxyManager`**. It is the one Network Extension
 provider whose job is exactly this: macOS hands it each TCP (or UDP) flow an
 application opens, by rules the provider writes, before any byte leaves the
 machine, and the provider either claims the flow or returns it to macOS to
-carry as if nothing were installed. Nothing about the Mac's proxy settings,
-routes, or DNS changes, and it is not a VPN.
+carry as if nothing were installed. The extension does not change routes or
+DNS. Capture separately points the active service's HTTP and HTTPS proxy at
+the explicit listener, so apps that honour a proxy — including the iOS
+Simulator — use `127.0.0.1:9090`. The extension stays for apps that ignore
+that setting. It is not a VPN.
 
 The others were considered and are the wrong shape:
 
@@ -63,7 +66,10 @@ second capture, and no second rule engine.
 
 It asks macOS for **outbound TCP to ports 80 and 443, IPv4 and IPv6, with
 loopback excluded**. Everything else — other ports, UDP, and therefore QUIC
-and DNS — never reaches it and is carried by macOS directly.
+and DNS — never reaches it and is carried by macOS directly. UDP is not
+added to the rules in order to count it: on current macOS, a UDP flow that
+the provider returns is terminated, which would break QUIC rather than
+observe it. A UDP flow that arrives anyway is counted and not claimed.
 
 ### The bridge speaks `CONNECT`
 
@@ -134,37 +140,106 @@ Every claimed flow would fail, and a Mac would lose its web traffic to a
 debugging tool that is not even open. So a bridge that cannot be reached is
 remembered for five seconds, during which the extension claims nothing; the
 flow that found out is carried directly by the extension. Nothing is captured
-meanwhile, and the app's panel says so in red rather than showing a green
-"on" over a Mac whose traffic is passing straight through.
+meanwhile. This Mac's row follows the capture lifecycle — Listening, Stopped,
+Needs Approval — and is not a second switch. Its detail says when traffic is
+passing straight through, rather than showing a ready capture over a Mac that
+is not recording it.
 
 ### Lifecycle, and who decides
 
 ```
-Turn On ─▶ OSSystemExtensionRequest.activationRequest
+Launch ─▶ start Contents/MacOS/proxy-engine (the process this app owns)
+        ─▶ IPC diagnostics: 127.0.0.1:9090 and 127.0.0.1:9091 are listening
+        ─▶ save the active service's HTTP and HTTPS proxy, then set both
+           to 127.0.0.1:9090
+        ─▶ Turn On (below)
+        ─▶ Listening, once the tunnel is connected
+
+Turn On ─▶ an enabled extension at this build's version is already installed:
+           skip ahead to the configuration
+         ─▶ otherwise OSSystemExtensionRequest.activationRequest
              │  macOS may ask for approval in System Settings ›
              │  General › Login Items & Extensions › Network Extensions
+             │  a different version is replaced by that same request
              ▼
            NETransparentProxyManager.saveToPreferences
              │  macOS may ask to allow ProxyLab to add proxy configurations
              ▼
            connection.startVPNTunnel ─▶ the extension's startProxy
 
-Turn Off ─▶ connection.stopVPNTunnel, and the configuration disabled
-Quit     ─▶ connection.stopVPNTunnel
+Stop    ─▶ restore each service that still has the proxy ProxyLab wrote
+        ─▶ if that restore does not land, leave the owned core running
+        ─▶ connection.stopVPNTunnel, and the configuration disabled
+        ─▶ SIGINT to the owned proxy-engine (its existing shutdown)
+        ─▶ SIGTERM, then SIGKILL, only if that same process is still alive
+
+Quit    ─▶ the same Stop, then the app exits
 ```
 
-**Nothing is turned on at launch.** The app reads what macOS says and
-changes nothing; the configuration is never on demand; and quitting the app
-stops it. The one thing that continues on its own is a Turn On that stopped to
-wait for approval: once macOS reports the extension allowed, the switch that
-was pressed finishes — in that session only. The extension stays installed
-after Turn Off, and is removed the way any system extension is.
+Each of those system calls has a bound. A call that does not return becomes
+an error, or Stop continues with the snapshot it already has. Waiting for a
+person is **Needs Approval** or **Needs CA Trust**, not Starting. Command-Q
+does not wait on a status refresh after the proxy is restored and the tunnel
+is off. A restore that does not verify leaves the app open and the core
+running.
 
-**The app never touches the system proxy.** A transparent proxy is a Network
-Extension configuration of its own, listed under System Settings › Network ›
-VPN & Filters, and ProxyLab reads and writes only the one whose provider is
-its own — another app's transparent proxy on the same Mac is never read,
-changed, or stopped.
+Launch starts capture. The system proxy is not written, and the tunnel is
+not switched on, until the bundled core reports both listeners ready. The
+proxy is restored before that core is stopped. The configuration is never
+on demand. The extension stays installed after Stop and after quit;
+installed and capturing are different states, and quit does not uninstall
+it.
+
+The first launch may stop at **Needs Approval** until the user allows the
+extension. That activation is not submitted again while it is outstanding.
+Once macOS reports the extension allowed, the Turn On that was waiting
+finishes — in that session only, and not if Stop or quit cancelled it.
+
+An explicit Stop is remembered until the user presses Start or the app
+quits, so a reconnect does not turn capture back on.
+
+If `9090` or `9091` is already in use, startup fails and the other process
+is not signaled. The app signals only the proxy-engine it launched. If that
+process exits on its own, the app restores the proxy it wrote, turns the
+tunnel off, and stops claiming that capture is listening. The extension's
+own bridge-failure fallback still carries flows directly during that
+hand-off.
+
+**Capture writes this Mac's HTTP and HTTPS proxy, and only those.** After
+both listeners are ready it saves the active network service's
+`HTTPEnable`, `HTTPProxy`, `HTTPPort`, `HTTPSEnable`, `HTTPSProxy`, and
+`HTTPSPort`, then sets both protocols to `127.0.0.1:9090`. The service is
+the one `State:/Network/Global/IPv4` (then IPv6) names as `PrimaryService`,
+not a service called Wi-Fi. A later change of the active service saves that
+service's previous settings on their own and applies the same endpoint.
+Stop and quit write each saved service back, and only when it still has
+the settings ProxyLab wrote. A service someone else changed is left as it
+is and reported. The exception list, FTP, SOCKS, and PAC are not read for
+writing and are not written. The commit goes through System Configuration
+with the administrator right
+`system.services.systemconfiguration.network`; macOS may ask for that
+password, and the grant is not shared and expires. The previous settings
+are stored at `~/.proxylab/run/system-proxy-ownership.json` before the
+commit, so a crash of the app or the core can put them back. The next
+launch restores that file before it starts the core, which is what asks
+for the administrator password. A force-kill or a restart cannot prompt
+while ProxyLab is not running, so the proxy stays at `127.0.0.1:9090`
+until the app is opened again. The leftover is not saved as the previous
+proxy.
+
+The two paths do not capture one request twice. A flow to `127.0.0.1:9090`
+is loopback, which the extension's rules and `FlowPolicy` leave alone, so
+the simulator's connection to the explicit proxy is not also bridged. The
+core's own upstream to port 80 or 443 is seen once: the bridge answers
+`508` before it connects or records when the source is the core, the
+extension then carries that flow itself, and later flows from that process
+are not claimed. A phone connecting to the LAN address on port `9090` is
+not a port the extension claims.
+
+The Network Extension configuration is a separate object, listed under
+System Settings › Network › VPN & Filters, and ProxyLab reads and writes
+only the one whose provider is its own — another app's transparent proxy
+on the same Mac is never read, changed, or stopped.
 
 ### The boundaries
 
@@ -187,22 +262,53 @@ The extension and the app's ability to install it rest on restricted
 entitlements that macOS honours only with a provisioning profile:
 `com.apple.developer.system-extension.install` on the app, and
 `com.apple.developer.networking.networkextension` = `app-proxy-provider` on
-both. The extension is also sandboxed, with `network.client` and an app
-group its Mach service sits under. `Scripts/make-app-bundle.sh` builds and
-signs both when given a team, an identity and the two profiles, and otherwise
-signs ad hoc with no entitlements — the app then runs exactly as before and
-the panel says transparent capture needs a signed build. Only an app in
-`/Applications` may install a system extension. Development signing is what is
-built; Developer ID signing, notarization and packaging are not.
+both. The extension is also sandboxed, with `network.client` and the app
+group `group.<app bundle id>`. Its Mach service name is that group followed
+by `.TransparentProxy`. The app itself is not sandboxed.
+
+`Scripts/make-app-bundle.sh` embeds the provider at
+`Contents/Library/SystemExtensions/<bundle id>.TransparentProxy.systemextension`.
+That suffix is `SystemTransparentProxyControl.extensionSuffix`. With
+`PROXYLAB_TEAM_ID`, `PROXYLAB_SIGNING_IDENTITY`, `PROXYLAB_APP_PROFILE`, and
+`PROXYLAB_EXTENSION_PROFILE` all set, the script checks the profiles and the
+identity, signs the extension, then signs the app. The bundle replaces
+anything already at the destination only after `Scripts/verify-app-bundle.sh`
+has checked those entitlements. With none of the four set, both are ad-hoc
+signed with no entitlements: the app runs as before and the panel says
+transparent capture needs a signed build. A partial set of variables is an
+error. Only an app in `/Applications` may install a system extension.
+
+The signature is the identity whose certificate organizational unit is the
+team, whether that identity is Mac Developer, Apple Development, or Developer
+ID Application. Notarization and an App Store or updater pipeline are not.
+The script does not enable the
+extension or change the system proxy. The variables and the checks are in
+`macos/ProxyLab/README.md`.
+
+### What a claimed flow becomes
+
+A TCP flow that is claimed is a `CONNECT` on the bridge. TLS (the first byte
+is `0x16`) is intercepted. HTTP/2 is the ALPN result `h2` on that TLS
+session, over TCP port 443, and each of its streams is an exchange. Plain
+HTTP is HTTP/1.1. A handshake that fails — the CA is not trusted, the
+application pins its certificate, or the origin's certificate does not
+verify — is stored as a failed exchange. It does not disappear. A connection
+that closes before sending a byte is discarded, because there was no request.
+HTTP/2 cleartext (`h2c`) on port 80 is not a TLS flow and is not carried as
+HTTP/2.
 
 ### What is not here
 
 UDP of any kind, so no QUIC and no DNS; ports other than 80 and 443;
-packet-level anything; per-application rules; an iOS Network Extension. A
-flow's source application is not recorded in the captured exchange — the
-exchange model is unchanged, and a bridged exchange's client address is the
-extension's loopback socket. HTTP/2 over cleartext (`h2c` prior knowledge) is
-not carried on port 80. Apps that pin certificates, and some macOS services,
-fail while capture is on, because every HTTPS connection is intercepted; the
-panel says so while it is on. Chrome prefers QUIC for many sites, and QUIC is
-UDP, so those requests are not captured unless Chrome falls back to TCP.
+packet-level anything; per-application rules; an iOS Network Extension. Those
+bypasses are not counted, because the flows are never delivered — the
+diagnostics sheet says so, rather than showing a zero that would look like
+"no QUIC happened". A UDP flow that is delivered anyway is counted under
+Bypassed UDP/QUIC and is not claimed. A flow's source application is not
+recorded in the captured exchange — the exchange model is unchanged, and a
+bridged exchange's client address is the extension's loopback socket. Apps
+that pin certificates, and some macOS services, fail while capture is on,
+because every claimed HTTPS connection is intercepted; the panel says so
+while it is on, and the failure is a failed exchange. Chrome, and
+URLSession, prefer QUIC for many sites. QUIC is UDP, so those requests are
+not captured unless the client falls back to TCP.

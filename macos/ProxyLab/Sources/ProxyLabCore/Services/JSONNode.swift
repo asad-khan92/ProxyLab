@@ -75,34 +75,36 @@ public struct JSONNode: Identifiable, Equatable, Sendable {
 
     /// `data` as a tree, or `nil` if it is not UTF-8 JSON this walker can read.
     public static func parse(_ data: Data) -> JSONNode? {
-        guard let source = String(data: data, encoding: .utf8) else { return nil }
+        // Reject a body that is not UTF-8, then walk the bytes. An array of
+        // characters would be many times the document.
+        guard String(data: data, encoding: .utf8) != nil else { return nil }
 
-        var parser = Parser(characters: Array(source))
+        var parser = Parser(bytes: [UInt8](data))
         guard let node = try? parser.parseValue(path: "$", key: nil) else { return nil }
         parser.skipWhitespace()
-        guard parser.index >= parser.characters.count else { return nil }
+        guard parser.index >= parser.bytes.count else { return nil }
 
         return node
     }
 }
 
 private struct Parser {
-    let characters: [Character]
+    let bytes: [UInt8]
     var index = 0
 
     mutating func parseValue(path: String, key: String?) throws -> JSONNode {
         skipWhitespace()
-        guard index < characters.count else { throw ParseError.truncated }
+        guard let byte = peek() else { throw ParseError.truncated }
 
-        switch characters[index] {
-        case "{":
+        switch byte {
+        case UInt8(ascii: "{"):
             return try parseObject(path: path, key: key)
-        case "[":
+        case UInt8(ascii: "["):
             return try parseArray(path: path, key: key)
-        case "\"":
+        case UInt8(ascii: "\""):
             let raw = takeString()
             return JSONNode(id: path, key: key, kind: .string, raw: raw, children: [])
-        case "-", "0"..."9":
+        case UInt8(ascii: "-"), UInt8(ascii: "0")...UInt8(ascii: "9"):
             let raw = takeNumber()
             return JSONNode(id: path, key: key, kind: .number, raw: raw, children: [])
         default:
@@ -120,27 +122,27 @@ private struct Parser {
         var children: [JSONNode] = []
         var member = 0
 
-        if index < characters.count, characters[index] == "}" {
+        if peek() == UInt8(ascii: "}") {
             index += 1
             return JSONNode(id: path, key: key, kind: .object, raw: "{}", children: [])
         }
 
-        while index < characters.count {
+        while index < bytes.count {
             skipWhitespace()
             let name = takeString()
             skipWhitespace()
-            if index < characters.count, characters[index] == ":" { index += 1 }
+            if peek() == UInt8(ascii: ":") { index += 1 }
             let decodedKey = String(name.dropFirst().dropLast())
             let child = try parseValue(path: "\(path).\(decodedKey)", key: decodedKey)
             children.append(child)
             member += 1
             skipWhitespace()
-            guard index < characters.count else { break }
-            if characters[index] == "," {
+            guard let byte = peek() else { break }
+            if byte == UInt8(ascii: ",") {
                 index += 1
                 continue
             }
-            if characters[index] == "}" {
+            if byte == UInt8(ascii: "}") {
                 index += 1
                 break
             }
@@ -155,23 +157,23 @@ private struct Parser {
         skipWhitespace()
         var children: [JSONNode] = []
 
-        if index < characters.count, characters[index] == "]" {
+        if peek() == UInt8(ascii: "]") {
             index += 1
             return JSONNode(id: path, key: key, kind: .array, raw: "[]", children: [])
         }
 
         var member = 0
-        while index < characters.count {
+        while index < bytes.count {
             let child = try parseValue(path: "\(path)[\(member)]", key: nil)
             children.append(child)
             member += 1
             skipWhitespace()
-            guard index < characters.count else { break }
-            if characters[index] == "," {
+            guard let byte = peek() else { break }
+            if byte == UInt8(ascii: ",") {
                 index += 1
                 continue
             }
-            if characters[index] == "]" {
+            if byte == UInt8(ascii: "]") {
                 index += 1
                 break
             }
@@ -183,50 +185,66 @@ private struct Parser {
 
     mutating func takeString() -> String {
         let start = index
-        guard index < characters.count, characters[index] == "\"" else {
-            return ""
-        }
+        guard peek() == UInt8(ascii: "\"") else { return "" }
         index += 1
-        while index < characters.count {
-            if characters[index] == "\\" {
+        while index < bytes.count {
+            if bytes[index] == UInt8(ascii: "\\") {
                 index += 2
                 continue
             }
-            if characters[index] == "\"" {
+            if bytes[index] == UInt8(ascii: "\"") {
                 index += 1
                 break
             }
             index += 1
         }
-        return String(characters[start..<min(index, characters.count)])
+        return text(from: start, to: min(index, bytes.count))
     }
 
     mutating func takeNumber() -> String {
         let start = index
-        while index < characters.count {
-            switch characters[index] {
-            case "-", "+", "0"..."9", ".", "e", "E":
+        while index < bytes.count {
+            switch bytes[index] {
+            case UInt8(ascii: "-"), UInt8(ascii: "+"), UInt8(ascii: "0")...UInt8(ascii: "9"),
+                UInt8(ascii: "."), UInt8(ascii: "e"), UInt8(ascii: "E"):
                 index += 1
             default:
-                return String(characters[start..<index])
+                return text(from: start, to: index)
             }
         }
-        return String(characters[start..<index])
+        return text(from: start, to: index)
     }
 
     mutating func takeLiteral() -> String {
         let start = index
-        while index < characters.count, characters[index].isLetter {
+        while index < bytes.count, isLetter(bytes[index]) {
             index += 1
         }
-        return String(characters[start..<index])
+        return text(from: start, to: index)
     }
 
     mutating func skipWhitespace() {
-        while index < characters.count, characters[index].isWhitespace {
+        while let byte = peek(), isJSONWhitespace(byte) {
             index += 1
         }
     }
+
+    func peek() -> UInt8? {
+        index < bytes.count ? bytes[index] : nil
+    }
+
+    func text(from start: Int, to end: Int) -> String {
+        String(decoding: bytes[start..<end], as: UTF8.self)
+    }
+}
+
+private func isJSONWhitespace(_ byte: UInt8) -> Bool {
+    byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D
+}
+
+private func isLetter(_ byte: UInt8) -> Bool {
+    (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "z"))
+        || (byte >= UInt8(ascii: "A") && byte <= UInt8(ascii: "Z"))
 }
 
 private enum ParseError: Error {

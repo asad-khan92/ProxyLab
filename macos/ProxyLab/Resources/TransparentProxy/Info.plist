@@ -5,17 +5,16 @@
   Extension packaged as a system extension.
 
   `Scripts/make-app-bundle.sh` copies this into
-  ProxyLab.app/Contents/Library/SystemExtensions/, replacing the two
-  placeholders:
+  ProxyLab.app/Contents/Library/SystemExtensions/, replacing:
 
       __APP_BUNDLE_ID__   the app's bundle identifier
-      __TEAM_ID__         the Apple Developer team the two are signed by
 
   `NetworkExtension` is what macOS reads to start it: the provider class to
   instantiate for a transparent proxy (`app-proxy` is the category a
   NETransparentProxyProvider belongs to), and the Mach service it is reached
-  on, which Apple requires to sit under an app group the extension is
-  entitled to.
+  on. That name must begin with an app group in the extension's
+  application-groups entitlement, so it is group.<app bundle id> followed by
+  .TransparentProxy.
 -->
 <plist version="1.0">
 <dict>
@@ -46,7 +45,7 @@
     <key>NetworkExtension</key>
     <dict>
         <key>NEMachServiceName</key>
-        <string>__TEAM_ID__.__APP_BUNDLE_ID__.TransparentProxy</string>
+        <string>group.__APP_BUNDLE_ID__.TransparentProxy</string>
         <key>NEProviderClasses</key>
         <dict>
             <key>com.apple.networkextension.app-proxy</key>
